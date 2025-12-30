@@ -220,16 +220,6 @@ function FluidScene({
         };
     }, [gradientFallbackTex, lutFallback3D]);
 
-    // Handle dynamic resizing
-    useEffect(() => {
-        if (!solver) return;
-        const currentGrid = solver.fields.getGridSize();
-        const currentDye = solver.fields.getDyeSize();
-        if (config.gridSize !== currentGrid || config.dyeSize !== currentDye) {
-            solver.resize(config.gridSize, config.dyeSize);
-        }
-    }, [config.gridSize, config.dyeSize, solver]);
-
     useEffect(() => {
         const url = postConfig.gradientMapUrl ?? '';
         if (!url) {

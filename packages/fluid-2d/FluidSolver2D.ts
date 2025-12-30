@@ -302,33 +302,6 @@ export class FluidSolver2D {
     private dyeBoundary!: { aToB: BoundaryCompute; bToA: BoundaryCompute };
     private gravity!: { aToB: GravityCompute; bToA: GravityCompute };
 
-    /**
-     * Resize the simulation.
-     * This recreates all textures, compute nodes, and the pass graph.
-     */
-    public resize(gridSize: number, dyeSize: number): void {
-        if (this.config.gridSize === gridSize && this.config.dyeSize === dyeSize) return;
-
-        // 1. Update config
-        this.config.gridSize = gridSize;
-        this.config.dyeSize = dyeSize;
-
-        // 2. Resize fields (recreates textures)
-        this.fields.resize(gridSize, dyeSize);
-
-        // 3. Re-initialize compute nodes (binds new textures)
-        this.initializeComputeNodes();
-
-        // 4. Rebuild PassGraph
-        this.graph.clear();
-        this.initPasses();
-
-        // 5. Clear simulation to avoid artifacts
-        this.clear();
-
-        console.log(`[FluidSolver2D] Resized to Grid:${gridSize} Dye:${dyeSize}`);
-    }
-
     // Temperature compute nodes (optional)
     private tempAdvect: { aToB: TemperatureAdvectCompute; bToA: TemperatureAdvectCompute } | null = null;
     private tempSplat: { aToB: TemperatureSplatCompute; bToA: TemperatureSplatCompute } | null = null;
@@ -1370,8 +1343,31 @@ export class FluidSolver2D {
         // Recreate compute nodes bound to these textures
         this.initializeComputeNodes();
 
+        // Rebuild PassGraph (closures capture new texture refs)
+        this.graph.clear();
+        this.initPasses();
+
         // Clear to a clean state
         this.clear();
+
+        console.log(`[FluidSolver2D] Resized to Grid:${gridSize} Dye:${dyeSize}`);
+    }
+
+    /**
+     * Resize the simulation grid dynamically.
+     * This will recreate all textures and compute nodes.
+     * @param gridSize - New simulation grid resolution
+     * @param dyeSize - New dye/color field resolution
+     */
+    resize(gridSize: number, dyeSize: number): void {
+        // Skip if no change
+        if (gridSize === this.config.gridSize && dyeSize === this.config.dyeSize) {
+            return;
+        }
+
+        this.config.gridSize = gridSize;
+        this.config.dyeSize = dyeSize;
+        this.rebuildTextures();
     }
 
     dispose(): void {

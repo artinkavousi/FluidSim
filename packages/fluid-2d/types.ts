@@ -60,6 +60,14 @@ export interface Splat {
   // Temperature field (for combustion-like effects)
   /** Optional temperature value to inject at this splat (0..10 typical range) */
   temperature?: number;
+
+  // Obstacle field (for painting obstacles)
+  /** Optional obstacle value to paint (0-1, where 1=solid obstacle) */
+  obstacle?: number;
+  /** Obstacle paint mode (0=paint, 1=erase) */
+  obstacleMode?: number;
+  /** Obstacle blend mode (0=replace, 1=max, 2=add) */
+  obstacleBlendMode?: number;
 }
 
 export interface SplatSource {

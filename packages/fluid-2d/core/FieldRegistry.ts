@@ -348,6 +348,15 @@ export const standardFields: FieldDefinition[] = [
         pingPong: false,
         description: 'Temporary dye buffer for MacCormack',
     },
+    {
+        id: 'obstacles',
+        label: 'Obstacles',
+        sizeSource: 'grid',
+        format: 'rgba16float',
+        pingPong: false,
+        debug: { colorMap: 'magnitude', scale: 1, bias: 0 },
+        description: 'Obstacle mask field (scalar)',
+    },
 ];
 
 /**
