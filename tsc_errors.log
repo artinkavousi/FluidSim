@@ -1,0 +1,3 @@
+packages/fluid-2d/postfx/types.ts(6,15): error TS2305: Module '"three/tsl"' has no exported member 'ShaderNodeObject'.
+packages/fluid-2d/postfx/types.ts(6,33): error TS2305: Module '"three/tsl"' has no exported member 'UniformNode'.
+packages/fluid-2d/postfx/types.ts(73,23): error TS2503: Cannot find namespace 'THREE'.
