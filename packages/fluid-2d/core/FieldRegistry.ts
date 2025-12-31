@@ -9,6 +9,9 @@
 import * as THREE from 'three/webgpu';
 import { PingPongTexture, SingleTexture } from './PingPongBuffer';
 
+export type FieldFormat = 'rgba16float' | 'rgba32float' | 'r16float' | 'rg16float';
+export type FieldMemoryPriority = 'low' | 'medium' | 'high';
+
 /**
  * Debug visualization settings for a field
  */
@@ -36,7 +39,7 @@ export interface FieldDefinition {
     customSize?: { width: number; height: number };
 
     /** Texture format */
-    format: 'rgba16float' | 'rgba32float' | 'r16float' | 'rg16float';
+    format: FieldFormat;
 
     /** Whether this field uses ping-pong (double buffering) */
     pingPong: boolean;
@@ -46,6 +49,42 @@ export interface FieldDefinition {
 
     /** Description of what this field stores */
     description?: string;
+
+    /** Optional: resolution scale relative to sizeSource (e.g. 0.5 = half-res) */
+    resolutionScale?: number;
+
+    /** Optional: lazy allocation (create textures on first access) */
+    lazyAllocation?: boolean;
+
+    /** Optional: memory budgeting hints (not enforced yet) */
+    memoryPriority?: FieldMemoryPriority;
+
+    /** Optional: fallback format if primary format is unsupported */
+    fallbackFormat?: FieldFormat;
+
+    /** Optional: alias this field to another field's underlying texture(s) */
+    aliasOf?: string;
+}
+
+export interface FieldRegistryOptions {
+    /**
+     * Optional format support check.
+     * If provided, `fallbackFormat` will be used when `format` is not supported.
+     */
+    isFormatSupported?: (format: FieldFormat) => boolean;
+
+    /** Optional VRAM budget (rough estimate) */
+    memoryBudgetBytes?: number;
+
+    /** Log a warning when the estimated budget is exceeded */
+    warnOnBudgetExceeded?: boolean;
+}
+
+export interface FieldMemoryStats {
+    allocatedBytes: number;
+    estimatedBytes: number;
+    memoryBudgetBytes?: number;
+    overBudgetBytes?: number;
 }
 
 /**
@@ -55,13 +94,20 @@ export class FieldRegistry {
     private fields: Map<string, FieldDefinition> = new Map();
     private textures: Map<string, PingPongTexture | SingleTexture> = new Map();
     private pingPongStates: Map<string, boolean> = new Map();
+    private aliases: Map<string, string> = new Map();
 
     private gridSize: number;
     private dyeSize: number;
+    private isFormatSupported?: (format: FieldFormat) => boolean;
+    private memoryBudgetBytes?: number;
+    private warnOnBudgetExceeded: boolean;
 
-    constructor(gridSize: number, dyeSize: number) {
+    constructor(gridSize: number, dyeSize: number, options?: FieldRegistryOptions) {
         this.gridSize = gridSize;
         this.dyeSize = dyeSize;
+        this.isFormatSupported = options?.isFormatSupported;
+        this.memoryBudgetBytes = options?.memoryBudgetBytes;
+        this.warnOnBudgetExceeded = options?.warnOnBudgetExceeded ?? true;
     }
 
     /**
@@ -74,11 +120,21 @@ export class FieldRegistry {
         }
 
         this.fields.set(def.id, def);
-        this.createTexture(def);
+
+        if (def.aliasOf) {
+            this.aliases.set(def.id, def.aliasOf);
+            return;
+        }
+
+        if (!def.lazyAllocation) {
+            this.createTexture(def);
+        }
 
         if (def.pingPong) {
             this.pingPongStates.set(def.id, true); // A is initial read
         }
+
+        this.checkMemoryBudget();
     }
 
     /**
@@ -95,13 +151,66 @@ export class FieldRegistry {
      */
     private createTexture(def: FieldDefinition): void {
         const size = this.getSize(def);
+        const resolvedFormat = this.resolveFormat(def);
 
         if (def.pingPong) {
             const tex = new PingPongTexture(size.width, size.height);
+            this.applyTextureFormat(tex.a, resolvedFormat);
+            this.applyTextureFormat(tex.b, resolvedFormat);
             this.textures.set(def.id, tex);
         } else {
             const tex = new SingleTexture(size.width, size.height);
+            this.applyTextureFormat(tex.texture, resolvedFormat);
             this.textures.set(def.id, tex);
+        }
+    }
+
+    private ensureTexture(def: FieldDefinition): void {
+        if (this.textures.has(def.id)) return;
+        this.createTexture(def);
+    }
+
+    private resolveId(id: string): string {
+        let current = id;
+        const seen = new Set<string>();
+        while (this.aliases.has(current)) {
+            if (seen.has(current)) {
+                throw new Error(`FieldRegistry: Alias cycle detected at "${current}"`);
+            }
+            seen.add(current);
+            current = this.aliases.get(current)!;
+        }
+        return current;
+    }
+
+    private resolveFormat(def: FieldDefinition): FieldFormat {
+        const desired = def.format;
+        if (!this.isFormatSupported) return desired;
+        if (this.isFormatSupported(desired)) return desired;
+        if (def.fallbackFormat && this.isFormatSupported(def.fallbackFormat)) {
+            return def.fallbackFormat;
+        }
+        return desired;
+    }
+
+    private applyTextureFormat(texture: THREE.Texture, format: FieldFormat): void {
+        switch (format) {
+            case 'rgba16float':
+                texture.format = THREE.RGBAFormat;
+                texture.type = THREE.HalfFloatType;
+                return;
+            case 'rgba32float':
+                texture.format = THREE.RGBAFormat;
+                texture.type = THREE.FloatType;
+                return;
+            case 'r16float':
+                texture.format = THREE.RedFormat;
+                texture.type = THREE.HalfFloatType;
+                return;
+            case 'rg16float':
+                texture.format = THREE.RGFormat;
+                texture.type = THREE.HalfFloatType;
+                return;
         }
     }
 
@@ -109,16 +218,23 @@ export class FieldRegistry {
      * Get the size for a field based on its sizeSource
      */
     private getSize(def: FieldDefinition): { width: number; height: number } {
+        const scale = def.resolutionScale ?? 1;
+        const scaled = (size: { width: number; height: number }) => {
+            const width = Math.max(1, Math.round(size.width * scale));
+            const height = Math.max(1, Math.round(size.height * scale));
+            return { width, height };
+        };
+
         switch (def.sizeSource) {
             case 'grid':
-                return { width: this.gridSize, height: this.gridSize };
+                return scaled({ width: this.gridSize, height: this.gridSize });
             case 'dye':
-                return { width: this.dyeSize, height: this.dyeSize };
+                return scaled({ width: this.dyeSize, height: this.dyeSize });
             case 'custom':
                 if (!def.customSize) {
                     throw new Error(`Field "${def.id}" has sizeSource 'custom' but no customSize`);
                 }
-                return def.customSize;
+                return scaled(def.customSize);
             default:
                 throw new Error(`Unknown sizeSource: ${def.sizeSource}`);
         }
@@ -128,13 +244,20 @@ export class FieldRegistry {
      * Get the current read texture for a field
      */
     getRead(id: string): THREE.StorageTexture {
-        const tex = this.textures.get(id);
+        const resolvedId = this.resolveId(id);
+        const def = this.fields.get(resolvedId);
+        if (!def) {
+            throw new Error(`FieldRegistry: Field "${id}" not found`);
+        }
+        this.ensureTexture(def);
+
+        const tex = this.textures.get(resolvedId);
         if (!tex) {
             throw new Error(`FieldRegistry: Field "${id}" not found`);
         }
 
         if (tex instanceof PingPongTexture) {
-            const isA = this.pingPongStates.get(id) ?? true;
+            const isA = this.pingPongStates.get(resolvedId) ?? true;
             return isA ? tex.a : tex.b;
         }
 
@@ -145,13 +268,20 @@ export class FieldRegistry {
      * Get the current write texture for a field (only valid for ping-pong fields)
      */
     getWrite(id: string): THREE.StorageTexture {
-        const tex = this.textures.get(id);
+        const resolvedId = this.resolveId(id);
+        const def = this.fields.get(resolvedId);
+        if (!def) {
+            throw new Error(`FieldRegistry: Field "${id}" not found`);
+        }
+        this.ensureTexture(def);
+
+        const tex = this.textures.get(resolvedId);
         if (!tex) {
             throw new Error(`FieldRegistry: Field "${id}" not found`);
         }
 
         if (tex instanceof PingPongTexture) {
-            const isA = this.pingPongStates.get(id) ?? true;
+            const isA = this.pingPongStates.get(resolvedId) ?? true;
             return isA ? tex.b : tex.a;
         }
 
@@ -163,7 +293,14 @@ export class FieldRegistry {
      * Get both textures for a ping-pong field
      */
     getBoth(id: string): { a: THREE.StorageTexture; b: THREE.StorageTexture } {
-        const tex = this.textures.get(id);
+        const resolvedId = this.resolveId(id);
+        const def = this.fields.get(resolvedId);
+        if (!def) {
+            throw new Error(`FieldRegistry: Field "${id}" not found`);
+        }
+        this.ensureTexture(def);
+
+        const tex = this.textures.get(resolvedId);
         if (!tex) {
             throw new Error(`FieldRegistry: Field "${id}" not found`);
         }
@@ -179,9 +316,10 @@ export class FieldRegistry {
      * Swap the ping-pong state for a field (call after write)
      */
     swap(id: string): void {
-        const current = this.pingPongStates.get(id);
+        const resolvedId = this.resolveId(id);
+        const current = this.pingPongStates.get(resolvedId);
         if (current !== undefined) {
-            this.pingPongStates.set(id, !current);
+            this.pingPongStates.set(resolvedId, !current);
         }
     }
 
@@ -189,7 +327,51 @@ export class FieldRegistry {
      * Get the current ping-pong state (true = A is read, false = B is read)
      */
     getState(id: string): boolean {
-        return this.pingPongStates.get(id) ?? true;
+        const resolvedId = this.resolveId(id);
+        return this.pingPongStates.get(resolvedId) ?? true;
+    }
+
+    /**
+     * Returns true if the underlying texture(s) for this field have been allocated.
+     */
+    isAllocated(id: string): boolean {
+        const resolvedId = this.resolveId(id);
+        return this.textures.has(resolvedId);
+    }
+
+    /**
+     * Get the dimensions of a field (does not allocate textures).
+     */
+    getFieldSize(id: string): { width: number; height: number } {
+        const resolvedId = this.resolveId(id);
+        const def = this.fields.get(resolvedId);
+        if (!def) throw new Error(`FieldRegistry: Field "${id}" not found`);
+        return this.getSize(def);
+    }
+
+    /**
+     * Alias a field id to another field's underlying texture(s).
+     */
+    alias(aliasId: string, targetId: string, opts?: { label?: string; description?: string }): void {
+        const targetDef = this.fields.get(targetId);
+        if (!targetDef) {
+            throw new Error(`FieldRegistry: Cannot alias "${aliasId}" to missing field "${targetId}"`);
+        }
+
+        const def: FieldDefinition = {
+            id: aliasId,
+            label: opts?.label ?? `${targetDef.label} (alias)`,
+            description: opts?.description ?? targetDef.description,
+            sizeSource: targetDef.sizeSource,
+            customSize: targetDef.customSize,
+            format: targetDef.format,
+            pingPong: targetDef.pingPong,
+            resolutionScale: targetDef.resolutionScale,
+            lazyAllocation: true,
+            aliasOf: targetId,
+        };
+
+        this.register(def);
     }
 
     /**
@@ -234,6 +416,71 @@ export class FieldRegistry {
         return this.dyeSize;
     }
 
+    private bytesPerPixel(format: FieldFormat): number {
+        switch (format) {
+            case 'r16float':
+                return 2;
+            case 'rg16float':
+                return 4;
+            case 'rgba16float':
+                return 8;
+            case 'rgba32float':
+                return 16;
+        }
+    }
+
+    private estimateFieldBytes(def: FieldDefinition): number {
+        const size = this.getSize(def);
+        const layers = def.pingPong ? 2 : 1;
+        return size.width * size.height * this.bytesPerPixel(this.resolveFormat(def)) * layers;
+    }
+
+    /**
+     * Rough VRAM estimate for allocated vs total (includes lazy-unallocated estimates).
+     */
+    getMemoryStats(): FieldMemoryStats {
+        let allocatedBytes = 0;
+        let estimatedBytes = 0;
+
+        const bases = new Set<string>();
+        for (const def of this.fields.values()) {
+            const baseId = this.resolveId(def.id);
+            if (bases.has(baseId)) continue;
+            bases.add(baseId);
+
+            const baseDef = this.fields.get(baseId);
+            if (!baseDef) continue;
+
+            const estimate = this.estimateFieldBytes(baseDef);
+            estimatedBytes += estimate;
+            if (this.textures.has(baseId)) allocatedBytes += estimate;
+        }
+
+        const memoryBudgetBytes = this.memoryBudgetBytes;
+        const overBudgetBytes =
+            memoryBudgetBytes !== undefined ? Math.max(0, estimatedBytes - memoryBudgetBytes) : undefined;
+
+        return { allocatedBytes, estimatedBytes, memoryBudgetBytes, overBudgetBytes };
+    }
+
+    setMemoryBudgetBytes(bytes?: number): void {
+        this.memoryBudgetBytes = bytes;
+        this.checkMemoryBudget();
+    }
+
+    private checkMemoryBudget(): void {
+        if (!this.warnOnBudgetExceeded) return;
+        if (this.memoryBudgetBytes === undefined) return;
+
+        const { estimatedBytes, overBudgetBytes } = this.getMemoryStats();
+        if (!overBudgetBytes || overBudgetBytes <= 0) return;
+
+        console.warn(
+            `[FieldRegistry] Estimated VRAM ${Math.round(estimatedBytes / (1024 * 1024))}MB exceeds budget ` +
+                `${Math.round(this.memoryBudgetBytes / (1024 * 1024))}MB by ${Math.round(overBudgetBytes / (1024 * 1024))}MB`
+        );
+    }
+
     /**
      * Resize all fields (recreates textures)
      */
@@ -242,6 +489,7 @@ export class FieldRegistry {
         this.dyeSize = dyeSize;
 
         for (const [id, def] of this.fields) {
+            if (def.aliasOf) continue;
             // Dispose old texture
             const oldTex = this.textures.get(id);
             if (oldTex instanceof PingPongTexture) {
@@ -251,14 +499,20 @@ export class FieldRegistry {
                 oldTex.texture.dispose();
             }
 
-            // Create new texture
-            this.createTexture(def);
+            // Create new texture (skip if lazy and never allocated)
+            if (oldTex || !def.lazyAllocation) {
+                this.createTexture(def);
+            } else {
+                this.textures.delete(id);
+            }
 
             // Reset ping-pong state
             if (def.pingPong) {
                 this.pingPongStates.set(id, true);
             }
         }
+
+        this.checkMemoryBudget();
     }
 
     /**
@@ -276,6 +530,7 @@ export class FieldRegistry {
         this.textures.clear();
         this.fields.clear();
         this.pingPongStates.clear();
+        this.aliases.clear();
     }
 }
 

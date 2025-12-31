@@ -21,10 +21,11 @@ This document proposes a concrete, staged plan to evolve the current `Fluidstudi
 
 ## Status (Still To Do / Next Up)
 
-- Pass graph abstraction + field registry (Section 4)
+- Pass graph abstraction + field registry (DONE: `packages/fluid-2d/core/PassGraph.ts`, `packages/fluid-2d/core/FieldRegistry.ts`)
 - MRT-based motion blur using velocity (Section 3C.1)
-- Sharpen/unsharp + richer LUT workflow (Section 3C.3)
-- GPU splat batching (Section 3D.3)
+- Sharpen/clarity + LUT import workflow (DONE: `packages/fluid-2d/postfx/PostFXPipeline2D.ts`, `packages/fluid-2d/render/Lut3D.ts`)
+- GPU splat batching (DONE: `packages/fluid-2d/nodes/SplatBatch.ts`, solver `splatBatchEnabled`)
+- Unified pipeline graph + metadata-driven control panel (see `DOCS/UPGRADE_PLANv4_UNIFIED_GRAPH.md`)
 
 It is written against the current architecture:
 

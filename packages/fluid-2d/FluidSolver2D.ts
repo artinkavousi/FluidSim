@@ -10,6 +10,10 @@ import * as THREE from 'three/webgpu';
 import {
     PingPongTexture, SingleTexture,
     PassGraph, type Pass,
+    type PassGroup,
+    type PassMetadata,
+    type PassTiming,
+    type FieldMemoryStats,
     FieldRegistry, createStandardFieldRegistry
 } from './core';
 import {
@@ -22,6 +26,12 @@ import {
     createVorticityForceNode,
     createVelocitySplatNode,
     createDyeSplatNode,
+    createVelocitySplatInPlaceTileNode,
+    createDyeSplatInPlaceTileNode,
+    createBatchedVelocitySplatNode,
+    createBatchedDyeSplatNode,
+    type SplatBatchCompute,
+    type PackedSplat,
     createClearNode,
     createViscosityNode,
     createTurbulenceNode,
@@ -35,6 +45,21 @@ import {
     createTemperatureSplatNode,
     createTemperatureBuoyancyNode,
     createTemperatureClearNode,
+    createPressureResidualNode,
+    createRestrict2xNode,
+    createProlongateAddNode,
+    createMacDivergenceNode,
+    createMacGradientSubtractNode,
+    createMacVelocityBoundaryNode,
+    createFuelAdvectNode,
+    createFuelSplatNode,
+    createCombustionNode,
+    createFireDyeNode,
+    createDyeChannelDissipationNode,
+    createObstacleSplatInPlaceTileNode,
+    createObstacleEnforceVelocityNode,
+    createObstacleEnforceDyeNode,
+    createObstacleEnforceScalarNode,
     type AdvectionCompute,
     type DivergenceCompute,
     type PressureCompute,
@@ -84,6 +109,13 @@ export interface FluidConfig2D {
     // Advanced parameters
     viscosity: number;
     vorticity: number;
+    // P2: Advanced vorticity options
+    vorticityEdgeAwareEnabled: boolean;
+    vorticityEdgeAwareStrength: number; // 0..2 typical
+    vorticityScaleMix: number; // 0..1 blend between small and large scale confinement
+
+    // P2: Staggered-style projection (MAC) option
+    macGridEnabled: boolean;
     pressureIterations: number;
     pressureAdaptive: boolean;
     pressureMinIterations: number;
@@ -102,6 +134,12 @@ export interface FluidConfig2D {
     splatQuality: number;
     // Cap splat passes to avoid frame spikes (expanded symmetry splats count).
     maxSplatsPerFrame: number;
+    // Use tiled in-place splats to avoid full-texture dispatch per splat.
+    splatTiledEnabled: boolean;
+    // Use GPU buffer-based batch splats for maximum throughput (single dispatch).
+    splatBatchEnabled: boolean;
+    // Maximum splats per batch dispatch (only used when splatBatchEnabled)
+    splatBatchMaxCount: number;
 
     // Symmetry
     symmetry: number;
@@ -122,6 +160,11 @@ export interface FluidConfig2D {
     pressureSolver: number;
     sorOmega: number;
     velocityDiffusion: number;
+    // P2: Multi-resolution pressure solver (2-level V-cycle correction)
+    pressureMultigridEnabled: boolean;
+    pressureMultigridPreSmooth: number;
+    pressureMultigridPostSmooth: number;
+    pressureMultigridCoarseIterations: number;
 
     turbulenceEnabled: boolean;
     turbulenceScale: number;
@@ -130,6 +173,11 @@ export interface FluidConfig2D {
     buoyancyEnabled: boolean;
     buoyancyStrength: number;
     ambientTemperature: number;
+
+    // P3: Multiphase (RGB dye phases)
+    multiphaseEnabled: boolean;
+    multiphaseDyeDissipationRGB: [number, number, number];
+    multiphaseBuoyancyWeightsRGB: [number, number, number];
 
     // Timestep control
     substepsEnabled: boolean;
@@ -143,6 +191,22 @@ export interface FluidConfig2D {
     temperatureBuoyancyEnabled: boolean; // use temp-based buoyancy instead of dye
     temperatureBuoyancyStrength: number;
     temperatureAmbient: number;
+
+    // Fuel + combustion system
+    fuelEnabled: boolean;
+    fuelDissipation: number;
+    combustionEnabled: boolean;
+    combustionRate: number;
+    combustionIgniteTemp: number;
+    combustionHeatPerFuel: number;
+    combustionTempDamp: number;
+    fireDyeEnabled: boolean;
+    fireDyeIntensity: number;
+    fireDyeTempScale: number;
+
+    // Obstacles (solid mask field)
+    obstaclesEnabled: boolean;
+    obstacleThreshold: number; // 0..1
 
     // Adaptive quality (driven by app/store; solver supports resize via setConfig())
     autoQualityEnabled: boolean;
@@ -189,6 +253,10 @@ export const defaultConfig2D: FluidConfig2D = {
     dyeDissipation: 0.985,
     viscosity: 0.2,
     vorticity: 12.0,
+    vorticityEdgeAwareEnabled: false,
+    vorticityEdgeAwareStrength: 1.0,
+    vorticityScaleMix: 0.0,
+    macGridEnabled: false,
     pressureIterations: 22,
     pressureAdaptive: true,
     pressureMinIterations: 6,
@@ -200,6 +268,9 @@ export const defaultConfig2D: FluidConfig2D = {
     turbulenceSpeed: 1.0,
     splatQuality: 2.0,
     maxSplatsPerFrame: 32,
+    splatTiledEnabled: true,
+    splatBatchEnabled: false,
+    splatBatchMaxCount: 256,
     symmetry: 0,
 
     splatFalloff: 2,
@@ -215,12 +286,20 @@ export const defaultConfig2D: FluidConfig2D = {
     pressureSolver: 0,
     sorOmega: 1.8,
     velocityDiffusion: 0.997,
+    pressureMultigridEnabled: false,
+    pressureMultigridPreSmooth: 6,
+    pressureMultigridPostSmooth: 6,
+    pressureMultigridCoarseIterations: 24,
     turbulenceEnabled: false,
     turbulenceScale: 1.0,
     turbulenceStrength: 0.5,
     buoyancyEnabled: false,
     buoyancyStrength: 0.0,
     ambientTemperature: 0.0,
+
+    multiphaseEnabled: false,
+    multiphaseDyeDissipationRGB: [1.0, 1.0, 1.0],
+    multiphaseBuoyancyWeightsRGB: [0.3333333, 0.3333333, 0.3333333],
 
     // Avoid "death spiral" on slower machines (clamp dt rather than substepping).
     substepsEnabled: false,
@@ -234,6 +313,21 @@ export const defaultConfig2D: FluidConfig2D = {
     temperatureBuoyancyEnabled: false,
     temperatureBuoyancyStrength: 1.0,
     temperatureAmbient: 0.0,
+
+    fuelEnabled: false,
+    fuelDissipation: 0.99,
+    combustionEnabled: false,
+    combustionRate: 1.0,
+    combustionIgniteTemp: 0.25,
+    combustionHeatPerFuel: 2.0,
+    combustionTempDamp: 0.995,
+    fireDyeEnabled: true,
+    fireDyeIntensity: 0.25,
+    fireDyeTempScale: 1.0,
+
+    // Obstacles defaults
+    obstaclesEnabled: false,
+    obstacleThreshold: 0.5,
 
     autoQualityEnabled: false,
     autoQualityTargetFps: 60,
@@ -279,6 +373,7 @@ export class FluidSolver2D {
         velB_dyeB_toA: MacCormackCompute;
     };
     private divergenceCompute!: { fromA: DivergenceCompute; fromB: DivergenceCompute };
+    private divergenceComputeMac!: { fromA: any; fromB: any };
     private pressureSolve!: { aToB: PressureCompute; bToA: PressureCompute };
     private gradientSubtract!: {
         velA_pA_toB: GradientSubtractCompute;
@@ -286,10 +381,20 @@ export class FluidSolver2D {
         velB_pA_toA: GradientSubtractCompute;
         velB_pB_toA: GradientSubtractCompute;
     };
+    private gradientSubtractMac!: { velA_pA_toB: any; velA_pB_toB: any; velB_pA_toA: any; velB_pB_toA: any };
     private vorticityCompute!: { fromA: VorticityCompute; fromB: VorticityCompute };
     private vorticityForce!: { aToB: VorticityForceCompute; bToA: VorticityForceCompute };
     private velocitySplat!: { aToB: SplatCompute; bToA: SplatCompute };
     private dyeSplat!: { aToB: SplatCompute; bToA: SplatCompute };
+    private velocitySplatTile!: { fromA: SplatCompute; fromB: SplatCompute; tileSize: number };
+    private dyeSplatTile!: { fromA: SplatCompute; fromB: SplatCompute; tileSize: number };
+    private velocitySplatBatch: { aToB: SplatBatchCompute; bToA: SplatBatchCompute } | null = null;
+    private dyeSplatBatch: { aToB: SplatBatchCompute; bToA: SplatBatchCompute } | null = null;
+    private obstacleSplatTile!: { compute: any; uniforms: any; tileSize: number };
+    private obstacleEnforceVelocity!: { aToB: any; bToA: any };
+    private obstacleEnforceDye!: { aToB: any; bToA: any };
+    private obstacleEnforceTemperature: { aToB: any; bToA: any } | null = null;
+    private obstaclesClearCompute: any | null = null;
     private viscosity!: { aToB: ViscosityCompute; bToA: ViscosityCompute };
     private turbulence!: { aToB: TurbulenceCompute; bToA: TurbulenceCompute };
     private buoyancy!: {
@@ -298,9 +403,18 @@ export class FluidSolver2D {
         velB_dyeA_toA: BuoyancyCompute;
         velB_dyeB_toA: BuoyancyCompute;
     };
+    private dyeChannelDissipation: { aToB: any; bToA: any } | null = null;
     private velocityBoundary!: { aToB: BoundaryCompute; bToA: BoundaryCompute };
+    private velocityBoundaryMac!: { aToB: any; bToA: any };
     private dyeBoundary!: { aToB: BoundaryCompute; bToA: BoundaryCompute };
     private gravity!: { aToB: GravityCompute; bToA: GravityCompute };
+
+    // Multi-resolution pressure helpers (optional)
+    private pressureResidual!: { fromA: any; fromB: any };
+    private residualRestrict!: any;
+    private coarsePressureSolve!: { aToB: PressureCompute; bToA: PressureCompute };
+    private coarseProlongateAdd!: { fineA_coarseA_toB: any; fineA_coarseB_toB: any; fineB_coarseA_toA: any; fineB_coarseB_toA: any };
+    private coarsePressureClear!: { a: any; b: any };
 
     // Temperature compute nodes (optional)
     private tempAdvect: { aToB: TemperatureAdvectCompute; bToA: TemperatureAdvectCompute } | null = null;
@@ -312,6 +426,11 @@ export class FluidSolver2D {
         velB_tempB_toA: TemperatureBuoyancyCompute;
     } | null = null;
     private tempClear: TemperatureClearCompute | null = null;
+
+    private fuelAdvect: { aToB: any; bToA: any } | null = null;
+    private fuelSplat: { aToB: any; bToA: any } | null = null;
+    private combustion: { aToB: any; bToA: any } | null = null;
+    private fireDye: { aToB: any; bToA: any } | null = null;
 
     // Clear nodes (cached)
     private clearComputes: any[] = [];
@@ -334,18 +453,63 @@ export class FluidSolver2D {
         // Initialize Field Registry
         this.fields = createStandardFieldRegistry(gridSize, dyeSize);
 
-        // Register Temperature field if enabled
-        if (this.config.temperatureEnabled) {
-            this.fields.register({
-                id: 'temperature',
-                label: 'Temperature',
+        // Multigrid pressure fields (allocated lazily; used when pressureMultigridEnabled).
+        // Note: these are registered unconditionally so toggling the option doesn't require a full solver rebuild.
+        this.fields.registerAll([
+            {
+                id: 'pressureResidual',
+                label: 'Pressure Residual',
+                sizeSource: 'grid',
+                format: 'rgba16float',
+                pingPong: false,
+                lazyAllocation: true,
+                description: 'Fine residual (b - A p) for multigrid',
+            },
+            {
+                id: 'pressureResidualCoarse',
+                label: 'Pressure Residual (Coarse)',
+                sizeSource: 'grid',
+                format: 'rgba16float',
+                pingPong: false,
+                resolutionScale: 0.5,
+                lazyAllocation: true,
+                description: 'Coarse residual for multigrid',
+            },
+            {
+                id: 'pressureCoarse',
+                label: 'Pressure (Coarse)',
                 sizeSource: 'grid',
                 format: 'rgba16float',
                 pingPong: true,
-                debug: { colorMap: 'heatmap', scale: 0.1, bias: 0 },
-                description: 'Temperature field (Heat)',
-            });
-        }
+                resolutionScale: 0.5,
+                lazyAllocation: true,
+                description: 'Coarse pressure/error buffer for multigrid',
+            },
+        ]);
+
+        // Temperature field (registered lazily so it can be enabled later without recreating the solver).
+        this.fields.register({
+            id: 'temperature',
+            label: 'Temperature',
+            sizeSource: 'grid',
+            format: 'rgba16float',
+            pingPong: true,
+            lazyAllocation: true,
+            debug: { colorMap: 'heatmap', scale: 0.1, bias: 0 },
+            description: 'Temperature field (Heat)',
+        });
+
+        // Fuel field (registered lazily so it can be enabled later without recreating the solver).
+        this.fields.register({
+            id: 'fuel',
+            label: 'Fuel',
+            sizeSource: 'grid',
+            format: 'rgba16float',
+            pingPong: true,
+            lazyAllocation: true,
+            debug: { colorMap: 'heatmap', scale: 0.1, bias: 0 },
+            description: 'Fuel scalar field for combustion/reaction',
+        });
 
         // Initialize compute nodes
         this.initializeComputeNodes();
@@ -369,6 +533,12 @@ export class FluidSolver2D {
         const vort = this.fields.getRead('vorticity');
         const velTemp = this.fields.getRead('velocityTemp');
         const dyeTemp = this.fields.getRead('dyeTemp');
+
+        // Multigrid pressure textures (coarse scale is fixed at 0.5 in field defs; config controls whether passes run).
+        const pressureResidual = this.fields.getRead('pressureResidual');
+        const pressureResidualCoarse = this.fields.getRead('pressureResidualCoarse');
+        const coarsePress = this.fields.getBoth('pressureCoarse');
+        const coarseSize = this.fields.getFieldSize('pressureCoarse');
 
         // Velocity advection
         this.velocityAdvect = {
@@ -409,11 +579,43 @@ export class FluidSolver2D {
             fromA: createDivergenceNode(vel.a, div, gridSize, gridSize),
             fromB: createDivergenceNode(vel.b, div, gridSize, gridSize),
         };
+        this.divergenceComputeMac = {
+            fromA: createMacDivergenceNode(vel.a, div, gridSize, gridSize),
+            fromB: createMacDivergenceNode(vel.b, div, gridSize, gridSize),
+        };
 
         // Pressure solve
         this.pressureSolve = {
             aToB: createPressureSolveNode(press.a, div, press.b, gridSize, gridSize),
             bToA: createPressureSolveNode(press.b, div, press.a, gridSize, gridSize),
+        };
+
+        // Multigrid helpers
+        this.pressureResidual = {
+            fromA: createPressureResidualNode(press.a, div, pressureResidual, gridSize, gridSize),
+            fromB: createPressureResidualNode(press.b, div, pressureResidual, gridSize, gridSize),
+        };
+        this.residualRestrict = createRestrict2xNode(
+            pressureResidual,
+            pressureResidualCoarse,
+            gridSize,
+            gridSize,
+            coarseSize.width,
+            coarseSize.height
+        );
+        this.coarsePressureSolve = {
+            aToB: createPressureSolveNode(coarsePress.a, pressureResidualCoarse, coarsePress.b, coarseSize.width, coarseSize.height),
+            bToA: createPressureSolveNode(coarsePress.b, pressureResidualCoarse, coarsePress.a, coarseSize.width, coarseSize.height),
+        };
+        this.coarseProlongateAdd = {
+            fineA_coarseA_toB: createProlongateAddNode(press.a, coarsePress.a, press.b, gridSize, gridSize, coarseSize.width, coarseSize.height),
+            fineA_coarseB_toB: createProlongateAddNode(press.a, coarsePress.b, press.b, gridSize, gridSize, coarseSize.width, coarseSize.height),
+            fineB_coarseA_toA: createProlongateAddNode(press.b, coarsePress.a, press.a, gridSize, gridSize, coarseSize.width, coarseSize.height),
+            fineB_coarseB_toA: createProlongateAddNode(press.b, coarsePress.b, press.a, gridSize, gridSize, coarseSize.width, coarseSize.height),
+        };
+        this.coarsePressureClear = {
+            a: createClearNode(coarsePress.a, coarseSize.width, coarseSize.height).compute,
+            b: createClearNode(coarsePress.b, coarseSize.width, coarseSize.height).compute,
         };
 
         // Gradient subtraction
@@ -423,6 +625,14 @@ export class FluidSolver2D {
             velB_pA_toA: createGradientSubtractNode(vel.b, press.a, vel.a, gridSize, gridSize),
             velB_pB_toA: createGradientSubtractNode(vel.b, press.b, vel.a, gridSize, gridSize),
         };
+        this.gradientSubtractMac = {
+            velA_pA_toB: createMacGradientSubtractNode(vel.a, press.a, vel.b, gridSize, gridSize),
+            velA_pB_toB: createMacGradientSubtractNode(vel.a, press.b, vel.b, gridSize, gridSize),
+            velB_pA_toA: createMacGradientSubtractNode(vel.b, press.a, vel.a, gridSize, gridSize),
+            velB_pB_toA: createMacGradientSubtractNode(vel.b, press.b, vel.a, gridSize, gridSize),
+        };
+
+        const obstaclesTex = this.fields.getRead('obstacles');
 
         // Vorticity
         this.vorticityCompute = {
@@ -432,8 +642,8 @@ export class FluidSolver2D {
 
         // Vorticity force
         this.vorticityForce = {
-            aToB: createVorticityForceNode(vel.a, vort, vel.b, gridSize, gridSize),
-            bToA: createVorticityForceNode(vel.b, vort, vel.a, gridSize, gridSize),
+            aToB: createVorticityForceNode(vel.a, vort, vel.b, gridSize, gridSize, obstaclesTex),
+            bToA: createVorticityForceNode(vel.b, vort, vel.a, gridSize, gridSize, obstaclesTex),
         };
 
         // Splats
@@ -446,6 +656,59 @@ export class FluidSolver2D {
             aToB: createDyeSplatNode(dye.a, dye.b, dyeSize, dyeSize),
             bToA: createDyeSplatNode(dye.b, dye.a, dyeSize, dyeSize),
         };
+
+        // Tiled splats (updates only tiles covering the splat bounds; avoids full-texture dispatch per splat).
+        const tileSize = 32;
+        this.velocitySplatTile = {
+            fromA: createVelocitySplatInPlaceTileNode(vel.a, gridSize, gridSize, tileSize),
+            fromB: createVelocitySplatInPlaceTileNode(vel.b, gridSize, gridSize, tileSize),
+            tileSize,
+        };
+        this.dyeSplatTile = {
+            fromA: createDyeSplatInPlaceTileNode(dye.a, dyeSize, dyeSize, tileSize),
+            fromB: createDyeSplatInPlaceTileNode(dye.b, dyeSize, dyeSize, tileSize),
+            tileSize,
+        };
+
+        // Obstacles (single, non-pingpong field)
+        this.obstacleSplatTile = {
+            ...createObstacleSplatInPlaceTileNode(obstaclesTex, gridSize, gridSize, tileSize),
+            tileSize,
+        };
+        this.obstacleEnforceVelocity = {
+            aToB: createObstacleEnforceVelocityNode(vel.a, obstaclesTex, vel.b, gridSize, gridSize),
+            bToA: createObstacleEnforceVelocityNode(vel.b, obstaclesTex, vel.a, gridSize, gridSize),
+        };
+        this.obstacleEnforceDye = {
+            aToB: createObstacleEnforceDyeNode(dye.a, obstaclesTex, dye.b, dyeSize, dyeSize, gridSize, gridSize),
+            bToA: createObstacleEnforceDyeNode(dye.b, obstaclesTex, dye.a, dyeSize, dyeSize, gridSize, gridSize),
+        };
+        if (this.config.temperatureEnabled && this.fields.isAllocated('temperature')) {
+            const temp = this.fields.getBoth('temperature');
+            this.obstacleEnforceTemperature = {
+                aToB: createObstacleEnforceScalarNode(temp.a, obstaclesTex, temp.b, gridSize, gridSize, gridSize, gridSize),
+                bToA: createObstacleEnforceScalarNode(temp.b, obstaclesTex, temp.a, gridSize, gridSize, gridSize, gridSize),
+            };
+        } else {
+            this.obstacleEnforceTemperature = null;
+        }
+
+        this.obstaclesClearCompute = createClearNode(obstaclesTex, gridSize, gridSize).compute;
+
+        // GPU buffer-based batch splats (single dispatch for all splats)
+        if (this.config.splatBatchEnabled) {
+            this.velocitySplatBatch = {
+                aToB: createBatchedVelocitySplatNode(vel.a, vel.b, gridSize, gridSize, this.config.splatBatchMaxCount),
+                bToA: createBatchedVelocitySplatNode(vel.b, vel.a, gridSize, gridSize, this.config.splatBatchMaxCount),
+            };
+            this.dyeSplatBatch = {
+                aToB: createBatchedDyeSplatNode(dye.a, dye.b, dyeSize, dyeSize, this.config.splatBatchMaxCount),
+                bToA: createBatchedDyeSplatNode(dye.b, dye.a, dyeSize, dyeSize, this.config.splatBatchMaxCount),
+            };
+        } else {
+            this.velocitySplatBatch = null;
+            this.dyeSplatBatch = null;
+        }
 
         // Viscosity (diffusion)
         this.viscosity = {
@@ -467,10 +730,19 @@ export class FluidSolver2D {
             velB_dyeB_toA: createBuoyancyNode(vel.b, dye.b, vel.a, gridSize, gridSize, dyeSize, dyeSize),
         };
 
+        this.dyeChannelDissipation = {
+            aToB: createDyeChannelDissipationNode(dye.a, dye.b, dyeSize, dyeSize),
+            bToA: createDyeChannelDissipationNode(dye.b, dye.a, dyeSize, dyeSize),
+        };
+
         // Boundary conditions (contain)
         this.velocityBoundary = {
             aToB: createVelocityBoundaryNode(vel.a, vel.b, gridSize, gridSize),
             bToA: createVelocityBoundaryNode(vel.b, vel.a, gridSize, gridSize),
+        };
+        this.velocityBoundaryMac = {
+            aToB: createMacVelocityBoundaryNode(vel.a, vel.b, gridSize, gridSize),
+            bToA: createMacVelocityBoundaryNode(vel.b, vel.a, gridSize, gridSize),
         };
         this.dyeBoundary = {
             aToB: createDyeBoundaryNode(dye.a, dye.b, dyeSize, dyeSize),
@@ -486,6 +758,16 @@ export class FluidSolver2D {
         // Temperature field (optional - for combustion-like effects)
         if (this.config.temperatureEnabled) {
             this.initializeTemperature();
+        } else {
+            this.tempAdvect = null;
+            this.tempSplat = null;
+            this.tempBuoyancy = null;
+            this.tempClear = null;
+        }
+
+        // Fuel/combustion nodes (can be enabled later via setConfig; initialize now if enabled at startup).
+        if (this.config.fuelEnabled) {
+            this.initializeFuel();
         }
 
         // Cache clear nodes for all textures (recreated whenever textures are recreated).
@@ -500,14 +782,28 @@ export class FluidSolver2D {
             createClearNode(dyeTemp, dyeSize, dyeSize).compute,
             createClearNode(div, gridSize, gridSize).compute,
             createClearNode(vort, gridSize, gridSize).compute,
+            createClearNode(obstaclesTex, gridSize, gridSize).compute,
+            createClearNode(pressureResidual, gridSize, gridSize).compute,
+            createClearNode(pressureResidualCoarse, coarseSize.width, coarseSize.height).compute,
+            createClearNode(coarsePress.a, coarseSize.width, coarseSize.height).compute,
+            createClearNode(coarsePress.b, coarseSize.width, coarseSize.height).compute,
         ];
 
         // Add temperature clear if enabled
-        if (this.fields.has('temperature')) {
+        if (this.fields.isAllocated('temperature')) {
             const temp = this.fields.getBoth('temperature');
             this.clearComputes.push(
                 createClearNode(temp.a, gridSize, gridSize).compute,
                 createClearNode(temp.b, gridSize, gridSize).compute
+            );
+        }
+
+        // Fuel clear if allocated
+        if (this.fields.isAllocated('fuel')) {
+            const fuel = this.fields.getBoth('fuel');
+            this.clearComputes.push(
+                createClearNode(fuel.a, gridSize, gridSize).compute,
+                createClearNode(fuel.b, gridSize, gridSize).compute
             );
         }
     }
@@ -520,6 +816,9 @@ export class FluidSolver2D {
 
         // Ensure field exists (it should, registered in constructor if enabled)
         if (!this.fields.has('temperature')) return;
+        if (!this.fields.isAllocated('temperature')) {
+            this.fields.getBoth('temperature');
+        }
 
         const vel = this.fields.getBoth('velocity');
         const temp = this.fields.getBoth('temperature');
@@ -566,6 +865,51 @@ export class FluidSolver2D {
         this.tempClear = createTemperatureClearNode(temp.a, gridSize, gridSize);
     }
 
+    private initializeFuel(): void {
+        const { gridSize, dyeSize } = this.config;
+        if (!this.fields.has('fuel')) return;
+        if (!this.fields.isAllocated('fuel')) {
+            // Allocate by accessing.
+            this.fields.getBoth('fuel');
+        }
+
+        const vel = this.fields.getBoth('velocity');
+        const fuel = this.fields.getBoth('fuel');
+
+        this.fuelAdvect = {
+            aToB: createFuelAdvectNode(vel.a, fuel.a, fuel.b, gridSize, gridSize, gridSize, gridSize),
+            bToA: createFuelAdvectNode(vel.b, fuel.b, fuel.a, gridSize, gridSize, gridSize, gridSize),
+        };
+
+        this.fuelSplat = {
+            aToB: createFuelSplatNode(fuel.a, fuel.b, gridSize, gridSize),
+            bToA: createFuelSplatNode(fuel.b, fuel.a, gridSize, gridSize),
+        };
+
+        // Combustion requires temperature.
+        if (this.fields.has('temperature')) {
+            const temp = this.fields.getBoth('temperature');
+            this.combustion = {
+                aToB: createCombustionNode(fuel.a, temp.a, fuel.b, temp.b, gridSize, gridSize),
+                bToA: createCombustionNode(fuel.b, temp.b, fuel.a, temp.a, gridSize, gridSize),
+            };
+        } else {
+            this.combustion = null;
+        }
+
+        // Fire dye uses temperature to inject color.
+        if (this.fields.has('temperature')) {
+            const temp = this.fields.getBoth('temperature');
+            const dye = this.fields.getBoth('dye');
+            this.fireDye = {
+                aToB: createFireDyeNode(dye.a, temp.a, dye.b, dyeSize, dyeSize, gridSize, gridSize),
+                bToA: createFireDyeNode(dye.b, temp.b, dye.a, dyeSize, dyeSize, gridSize, gridSize),
+            };
+        } else {
+            this.fireDye = null;
+        }
+    }
+
     private initPasses(): void {
         const passes: Pass[] = [
             // 2. Vorticity Confinement
@@ -592,6 +936,9 @@ export class FluidSolver2D {
                         this.vorticityForce.bToA.uniforms.solid.value = solid;
                         const vForce = this.fields.getState('velocity') ? this.vorticityForce.aToB : this.vorticityForce.bToA;
                         vForce.uniforms.vorticityStrength.value = this.config.vorticity;
+                        vForce.uniforms.edgeAwareEnabled.value = (this.config.vorticityEdgeAwareEnabled ?? false) ? 1 : 0;
+                        vForce.uniforms.edgeAwareStrength.value = this.config.vorticityEdgeAwareStrength ?? 1.0;
+                        vForce.uniforms.scaleMix.value = this.config.vorticityScaleMix ?? 0.0;
                         renderer.compute(vForce.compute);
                         this.fields.swap('velocity');
                     }
@@ -712,6 +1059,10 @@ export class FluidSolver2D {
                         this.buoyancy.velA_dyeB_toB.uniforms.dt.value = dt;
                         this.buoyancy.velB_dyeA_toA.uniforms.dt.value = dt;
                         this.buoyancy.velB_dyeB_toA.uniforms.dt.value = dt;
+                        const w = this.config.multiphaseBuoyancyWeightsRGB ?? [0.3333333, 0.3333333, 0.3333333];
+                        for (const n of [this.buoyancy.velA_dyeA_toB, this.buoyancy.velA_dyeB_toB, this.buoyancy.velB_dyeA_toA, this.buoyancy.velB_dyeB_toA]) {
+                            n.uniforms.weights.value.set(w[0], w[1], w[2]);
+                        }
                         if (this.tempBuoyancy) {
                             this.tempBuoyancy.velA_tempA_toB.uniforms.dt.value = dt;
                             this.tempBuoyancy.velA_tempB_toB.uniforms.dt.value = dt;
@@ -760,6 +1111,24 @@ export class FluidSolver2D {
                 }
             },
 
+            // 4.5 Obstacles (pre-projection velocity enforcement)
+            {
+                id: 'obstaclesVelocityPre',
+                label: 'Obstacles: Velocity',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer) => {
+                    if (!(this.config.obstaclesEnabled ?? false)) return;
+                    const thr = this.config.obstacleThreshold ?? 0.5;
+                    this.obstacleEnforceVelocity.aToB.uniforms.threshold.value = thr;
+                    this.obstacleEnforceVelocity.bToA.uniforms.threshold.value = thr;
+
+                    const node = this.fields.getState('velocity') ? this.obstacleEnforceVelocity.aToB : this.obstacleEnforceVelocity.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('velocity');
+                }
+            },
+
             // 5. Divergence
             {
                 id: 'divergence',
@@ -769,10 +1138,12 @@ export class FluidSolver2D {
                 compute: null,
                 execute: (renderer) => {
                     const solid = (this.config.containFluid ?? false) ? 1 : 0;
-                    this.divergenceCompute.fromA.uniforms.solid.value = solid;
-                    this.divergenceCompute.fromB.uniforms.solid.value = solid;
+                    const useMac = this.config.macGridEnabled ?? false;
+                    const divNode = useMac ? this.divergenceComputeMac : this.divergenceCompute;
+                    divNode.fromA.uniforms.solid.value = solid;
+                    divNode.fromB.uniforms.solid.value = solid;
 
-                    const compute = this.fields.getState('velocity') ? this.divergenceCompute.fromA : this.divergenceCompute.fromB;
+                    const compute = this.fields.getState('velocity') ? divNode.fromA : divNode.fromB;
                     renderer.compute(compute.compute);
                 }
             },
@@ -801,9 +1172,62 @@ export class FluidSolver2D {
                         ? Math.max(minIt, Math.min(maxIt, Math.round(baseIterations * (dt / dtRef))))
                         : baseIterations;
 
-                    for (let i = 0; i < it; i++) {
-                        const pressureSolve = this.fields.getState('pressure') ? this.pressureSolve.aToB : this.pressureSolve.bToA;
-                        renderer.compute(pressureSolve.compute);
+                    const multigridOn = this.config.pressureMultigridEnabled ?? false;
+                    if (!multigridOn) {
+                        for (let i = 0; i < it; i++) {
+                            const pressureSolve = this.fields.getState('pressure') ? this.pressureSolve.aToB : this.pressureSolve.bToA;
+                            renderer.compute(pressureSolve.compute);
+                            this.fields.swap('pressure');
+                        }
+                        return;
+                    }
+
+                    // 2-level V-cycle correction (fine residual -> coarse solve -> prolongate correction).
+                    const pre = Math.max(0, Math.round(this.config.pressureMultigridPreSmooth ?? 6));
+                    const post = Math.max(0, Math.round(this.config.pressureMultigridPostSmooth ?? 6));
+                    const coarseIt = Math.max(1, Math.round(this.config.pressureMultigridCoarseIterations ?? 24));
+
+                    // Pre-smoothing on fine grid.
+                    for (let i = 0; i < pre; i++) {
+                        const p = this.fields.getState('pressure') ? this.pressureSolve.aToB : this.pressureSolve.bToA;
+                        renderer.compute(p.compute);
+                        this.fields.swap('pressure');
+                    }
+
+                    // Residual on fine grid (b - A p), then restrict to coarse grid.
+                    const r = this.fields.getState('pressure') ? this.pressureResidual.fromA : this.pressureResidual.fromB;
+                    r.uniforms.solid.value = solid;
+                    renderer.compute(r.compute);
+                    renderer.compute(this.residualRestrict.compute);
+
+                    // Coarse solve (error equation) on `pressureCoarse` field.
+                    renderer.compute(this.coarsePressureClear.a);
+                    renderer.compute(this.coarsePressureClear.b);
+                    this.coarsePressureSolve.aToB.uniforms.omega.value = omega;
+                    this.coarsePressureSolve.bToA.uniforms.omega.value = omega;
+                    this.coarsePressureSolve.aToB.uniforms.solid.value = solid;
+                    this.coarsePressureSolve.bToA.uniforms.solid.value = solid;
+                    for (let i = 0; i < coarseIt; i++) {
+                        const e = this.fields.getState('pressureCoarse') ? this.coarsePressureSolve.aToB : this.coarsePressureSolve.bToA;
+                        renderer.compute(e.compute);
+                        this.fields.swap('pressureCoarse');
+                    }
+
+                    // Prolongate + add correction into fine pressure (writes to the opposite ping-pong buffer).
+                    const isFineA = this.fields.getState('pressure');
+                    const isCoarseA = this.fields.getState('pressureCoarse');
+                    const add =
+                        isFineA
+                            ? (isCoarseA ? this.coarseProlongateAdd.fineA_coarseA_toB : this.coarseProlongateAdd.fineA_coarseB_toB)
+                            : (isCoarseA ? this.coarseProlongateAdd.fineB_coarseA_toA : this.coarseProlongateAdd.fineB_coarseB_toA);
+                    add.uniforms.scale.value = 1.0;
+                    renderer.compute(add.compute);
+                    this.fields.swap('pressure');
+
+                    // Post-smoothing on fine grid.
+                    for (let i = 0; i < post; i++) {
+                        const p = this.fields.getState('pressure') ? this.pressureSolve.aToB : this.pressureSolve.bToA;
+                        renderer.compute(p.compute);
                         this.fields.swap('pressure');
                     }
                 }
@@ -818,18 +1242,20 @@ export class FluidSolver2D {
                 compute: null,
                 execute: (renderer) => {
                     const solid = (this.config.containFluid ?? false) ? 1 : 0;
-                    this.gradientSubtract.velA_pA_toB.uniforms.solid.value = solid;
-                    this.gradientSubtract.velA_pB_toB.uniforms.solid.value = solid;
-                    this.gradientSubtract.velB_pA_toA.uniforms.solid.value = solid;
-                    this.gradientSubtract.velB_pB_toA.uniforms.solid.value = solid;
+                    const useMac = this.config.macGridEnabled ?? false;
+                    const grad = useMac ? this.gradientSubtractMac : this.gradientSubtract;
+                    grad.velA_pA_toB.uniforms.solid.value = solid;
+                    grad.velA_pB_toB.uniforms.solid.value = solid;
+                    grad.velB_pA_toA.uniforms.solid.value = solid;
+                    grad.velB_pB_toA.uniforms.solid.value = solid;
 
                     const isVelA = this.fields.getState('velocity');
                     const isPressA = this.fields.getState('pressure');
 
                     const compute =
                         isVelA
-                            ? (isPressA ? this.gradientSubtract.velA_pA_toB : this.gradientSubtract.velA_pB_toB)
-                            : (isPressA ? this.gradientSubtract.velB_pA_toA : this.gradientSubtract.velB_pB_toA);
+                            ? (isPressA ? grad.velA_pA_toB : grad.velA_pB_toB)
+                            : (isPressA ? grad.velB_pA_toA : grad.velB_pB_toA);
                     renderer.compute(compute.compute);
                     this.fields.swap('velocity');
                 }
@@ -844,10 +1270,30 @@ export class FluidSolver2D {
                 compute: null,
                 execute: (renderer) => {
                     if (this.config.containFluid) {
-                        const boundary = this.fields.getState('velocity') ? this.velocityBoundary.aToB : this.velocityBoundary.bToA;
+                        const useMac = this.config.macGridEnabled ?? false;
+                        const bc = useMac ? this.velocityBoundaryMac : this.velocityBoundary;
+                        const boundary = this.fields.getState('velocity') ? bc.aToB : bc.bToA;
                         renderer.compute(boundary.compute);
                         this.fields.swap('velocity');
                     }
+                }
+            },
+
+            // 8.5 Obstacles (post-projection velocity enforcement)
+            {
+                id: 'obstaclesVelocityPost',
+                label: 'Obstacles: Velocity (post)',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer) => {
+                    if (!(this.config.obstaclesEnabled ?? false)) return;
+                    const thr = this.config.obstacleThreshold ?? 0.5;
+                    this.obstacleEnforceVelocity.aToB.uniforms.threshold.value = thr;
+                    this.obstacleEnforceVelocity.bToA.uniforms.threshold.value = thr;
+
+                    const node = this.fields.getState('velocity') ? this.obstacleEnforceVelocity.aToB : this.obstacleEnforceVelocity.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('velocity');
                 }
             },
 
@@ -911,6 +1357,43 @@ export class FluidSolver2D {
                 }
             },
 
+            // 10.5 Obstacles (dye enforcement)
+            {
+                id: 'obstaclesDye',
+                label: 'Obstacles: Dye',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer) => {
+                    if (!(this.config.obstaclesEnabled ?? false)) return;
+                    const thr = this.config.obstacleThreshold ?? 0.5;
+                    this.obstacleEnforceDye.aToB.uniforms.threshold.value = thr;
+                    this.obstacleEnforceDye.bToA.uniforms.threshold.value = thr;
+
+                    const node = this.fields.getState('dye') ? this.obstacleEnforceDye.aToB : this.obstacleEnforceDye.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('dye');
+                }
+            },
+
+            // 10.6 Multiphase dissipation (per-channel)
+            {
+                id: 'multiphaseDye',
+                label: 'Multiphase Dye',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer) => {
+                    if (!(this.config.multiphaseEnabled ?? false)) return;
+                    if (!this.dyeChannelDissipation) return;
+                    const d = this.config.multiphaseDyeDissipationRGB ?? [1.0, 1.0, 1.0];
+                    this.dyeChannelDissipation.aToB.uniforms.dissipationRGB.value.set(d[0], d[1], d[2]);
+                    this.dyeChannelDissipation.bToA.uniforms.dissipationRGB.value.set(d[0], d[1], d[2]);
+
+                    const node = this.fields.getState('dye') ? this.dyeChannelDissipation.aToB : this.dyeChannelDissipation.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('dye');
+                }
+            },
+
             // 11. Advect Temperature
             {
                 id: 'advectTemperature',
@@ -933,6 +1416,118 @@ export class FluidSolver2D {
                         renderer.compute(tempAdvect.compute);
                         this.fields.swap('temperature');
                     }
+                }
+            },
+
+            // 11.5 Obstacles (temperature enforcement)
+            {
+                id: 'obstaclesTemperature',
+                label: 'Obstacles: Temperature',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer) => {
+                    if (!(this.config.obstaclesEnabled ?? false)) return;
+                    if (!this.obstacleEnforceTemperature || !this.fields.has('temperature')) return;
+
+                    const thr = this.config.obstacleThreshold ?? 0.5;
+                    this.obstacleEnforceTemperature.aToB.uniforms.threshold.value = thr;
+                    this.obstacleEnforceTemperature.bToA.uniforms.threshold.value = thr;
+
+                    const node = this.fields.getState('temperature') ? this.obstacleEnforceTemperature.aToB : this.obstacleEnforceTemperature.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('temperature');
+                }
+            }
+            ,
+
+            // 12. Advect Fuel
+            {
+                id: 'advectFuel',
+                label: 'Advect Fuel',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer, dt) => {
+                    if (!(this.config.fuelEnabled ?? false)) return;
+                    if (!this.fuelAdvect) this.initializeFuel();
+                    if (!this.fuelAdvect || !this.fields.has('fuel')) return;
+
+                    const dissipation = this.config.fuelDissipation ?? 0.99;
+                    this.fuelAdvect.aToB.uniforms.dt.value = dt;
+                    this.fuelAdvect.bToA.uniforms.dt.value = dt;
+                    this.fuelAdvect.aToB.uniforms.dissipation.value = dissipation;
+                    this.fuelAdvect.bToA.uniforms.dissipation.value = dissipation;
+
+                    const adv = this.fields.getState('fuel') ? this.fuelAdvect.aToB : this.fuelAdvect.bToA;
+                    renderer.compute(adv.compute);
+                    this.fields.swap('fuel');
+                }
+            },
+
+            // 13. Combustion (fuel -> temperature)
+            {
+                id: 'combustion',
+                label: 'Combustion',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer, dt) => {
+                    if (!(this.config.combustionEnabled ?? false)) return;
+                    if (!(this.config.fuelEnabled ?? false)) return;
+                    if (!this.fields.has('temperature')) return;
+                    if (!this.combustion) this.initializeFuel();
+                    if (!this.combustion || !this.fields.has('fuel')) return;
+
+                    const rate = this.config.combustionRate ?? 1.0;
+                    const ignite = this.config.combustionIgniteTemp ?? 0.25;
+                    const heat = this.config.combustionHeatPerFuel ?? 2.0;
+                    const damp = this.config.combustionTempDamp ?? 0.995;
+
+                    this.combustion.aToB.uniforms.dt.value = dt;
+                    this.combustion.bToA.uniforms.dt.value = dt;
+                    this.combustion.aToB.uniforms.rate.value = rate;
+                    this.combustion.bToA.uniforms.rate.value = rate;
+                    this.combustion.aToB.uniforms.igniteTemp.value = ignite;
+                    this.combustion.bToA.uniforms.igniteTemp.value = ignite;
+                    this.combustion.aToB.uniforms.heatPerFuel.value = heat;
+                    this.combustion.bToA.uniforms.heatPerFuel.value = heat;
+                    this.combustion.aToB.uniforms.tempDamp.value = damp;
+                    this.combustion.bToA.uniforms.tempDamp.value = damp;
+
+                    const isFuelA = this.fields.getState('fuel');
+                    const isTempA = this.fields.getState('temperature');
+                    // Combustion node expects fuel/temp to be in matching pingpong state.
+                    // If they are desynced, do a one-time align swap of fuel to match temperature.
+                    if (isFuelA !== isTempA) this.fields.swap('fuel');
+
+                    const node = this.fields.getState('fuel') ? this.combustion.aToB : this.combustion.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('fuel');
+                    this.fields.swap('temperature');
+                }
+            },
+
+            // 14. Fire dye injection (temperature -> dye)
+            {
+                id: 'fireDye',
+                label: 'Fire Dye',
+                enabled: true,
+                inputs: [], outputs: [], uniforms: {}, compute: null,
+                execute: (renderer) => {
+                    if (!(this.config.fireDyeEnabled ?? true)) return;
+                    if (!(this.config.combustionEnabled ?? false)) return;
+                    if (!this.fields.has('temperature')) return;
+                    if (!this.fireDye) this.initializeFuel();
+                    if (!this.fireDye) return;
+
+                    const intensity = this.config.fireDyeIntensity ?? 0.25;
+                    const tscale = this.config.fireDyeTempScale ?? 1.0;
+                    this.fireDye.aToB.uniforms.intensity.value = intensity;
+                    this.fireDye.bToA.uniforms.intensity.value = intensity;
+                    this.fireDye.aToB.uniforms.temperatureScale.value = tscale;
+                    this.fireDye.bToA.uniforms.temperatureScale.value = tscale;
+
+                    const node = this.fields.getState('dye') ? this.fireDye.aToB : this.fireDye.bToA;
+                    renderer.compute(node.compute);
+                    this.fields.swap('dye');
                 }
             }
         ];
@@ -975,6 +1570,157 @@ export class FluidSolver2D {
 
         const toProcess = capSplatsPerFrame > 0 ? Math.min(capSplatsPerFrame, backlog) : backlog;
 
+        const falloffK = (falloff: number): number => {
+            const v = Math.max(0, Math.min(3, Math.round(falloff)));
+            if (v === 3) return 4.0;
+            if (v === 2) return 2.0;
+            if (v === 1) return 1.0;
+            return 0.5;
+        };
+
+        const cutoffDistSqFromRadius = (radius: number, softness: number, falloff: number): number => {
+            const k = falloffK(falloff);
+            const r = radius * Math.max(softness, 0.05);
+            const eps = 1e-4;
+            const distSq = (-r / Math.max(1e-6, k)) * Math.log(eps);
+            return Math.max(0, distSq);
+        };
+
+        // ============================================
+        // GPU Batch Mode - Single dispatch for all splats
+        // ============================================
+        if (this.config.splatBatchEnabled && this.velocitySplatBatch && this.dyeSplatBatch) {
+            const batchSplats: PackedSplat[] = [];
+
+            for (let i = 0; i < toProcess; i++) {
+                const splat = this.splatQueueExpanded[this.splatQueueExpandedStart + i];
+                const dy = (splat.flipDy ?? false) ? -splat.dy : splat.dy;
+
+                const baseRadius = splat.radius ?? this.config.dyeRadius;
+                const radiusScale = splat.radiusScale ?? 1.0;
+                const velBaseRadius = splat.radius ?? (this.config.velocityRadius ?? this.config.dyeRadius);
+                const velRadius = velBaseRadius * radiusScale * this.config.forceSplatRadius;
+                const dyeRadius = baseRadius * radiusScale * this.config.dyeSplatRadius;
+
+                const velScale = this.config.velocityForce * this.config.splatVelocityScale * (splat.velocityScale ?? 1.0);
+                const dyeScale = this.config.dyeIntensity * (splat.dyeScale ?? 1.0);
+                const colorBoost = this.config.splatColorBoost * (splat.colorBoost ?? 1.0) * (splat.opacity ?? 1);
+
+                const softness = splat.splatSoftness ?? this.config.splatSoftness ?? 1.0;
+                const falloff = splat.splatFalloff ?? this.config.splatFalloff ?? this.config.splatQuality ?? 2;
+                const blendMode = splat.splatBlendMode ?? this.config.splatBlendMode ?? 0;
+
+                batchSplats.push({
+                    x: splat.x,
+                    y: splat.y,
+                    dx: splat.dx * velScale,
+                    dy: dy * velScale,
+                    r: splat.color[0] * colorBoost,
+                    g: splat.color[1] * colorBoost,
+                    b: splat.color[2] * colorBoost,
+                    a: 1.0,
+                    radius: dyeRadius,
+                    softness,
+                    falloff,
+                    blendMode,
+                });
+            }
+
+            const velBatch = (this.fields.getState('velocity') ? this.velocitySplatBatch.aToB : this.velocitySplatBatch.bToA);
+            const dyeBatch = (this.fields.getState('dye') ? this.dyeSplatBatch.aToB : this.dyeSplatBatch.bToA);
+
+            // Upload and dispatch velocity batch (read->write), then swap once.
+            velBatch.uploadSplats(batchSplats);
+            this.renderer.compute(velBatch.compute);
+            this.fields.swap('velocity');
+
+            // Upload and dispatch dye batch (read->write), then swap once.
+            dyeBatch.uploadSplats(batchSplats);
+            this.renderer.compute(dyeBatch.compute);
+            this.fields.swap('dye');
+
+            // Apply per-splat fields that aren't included in the packed batch format.
+            for (let i = 0; i < toProcess; i++) {
+                const splat = this.splatQueueExpanded[this.splatQueueExpandedStart + i];
+
+                const x = splat.x;
+                const y = splat.y;
+
+                const baseRadius = splat.radius ?? this.config.dyeRadius;
+                const radiusScale = splat.radiusScale ?? 1.0;
+                const dyeRadius = baseRadius * radiusScale * this.config.dyeSplatRadius;
+
+                const softness = splat.splatSoftness ?? this.config.splatSoftness ?? 1.0;
+                const falloff = splat.splatFalloff ?? this.config.splatFalloff ?? this.config.splatQuality ?? 2;
+                const blendMode = splat.splatBlendMode ?? this.config.splatBlendMode ?? 0;
+
+                // Obstacle splat (tiled in-place)
+                if (splat.obstacle !== undefined && this.obstacleSplatTile) {
+                    const obstacleMode = Math.max(0, Math.min(1, Math.round(splat.obstacleMode ?? 0)));
+                    const obstacleBlendMode = Math.max(0, Math.min(2, Math.round(splat.obstacleBlendMode ?? 1)));
+                    const obstacleValue = Math.max(0, Math.min(1, splat.obstacle));
+
+                    const tileSize = this.obstacleSplatTile.tileSize as number;
+                    const radius = baseRadius * radiusScale;
+                    const cutoffDistSq = cutoffDistSqFromRadius(radius, softness, falloff);
+
+                    this.obstacleSplatTile.uniforms.splatPos.value.set(x, y);
+                    this.obstacleSplatTile.uniforms.obstacleValue.value = obstacleValue;
+                    this.obstacleSplatTile.uniforms.radius.value = radius;
+                    this.obstacleSplatTile.uniforms.softness.value = softness;
+                    this.obstacleSplatTile.uniforms.falloff.value = falloff;
+                    this.obstacleSplatTile.uniforms.mode.value = obstacleMode;
+                    this.obstacleSplatTile.uniforms.blendMode.value = obstacleBlendMode;
+                    this.obstacleSplatTile.uniforms.cutoffDistSq.value = cutoffDistSq;
+
+                    const cx = Math.floor(x * this.config.gridSize);
+                    const cy = Math.floor(y * this.config.gridSize);
+                    const radPx = Math.ceil(Math.sqrt(cutoffDistSq) * this.config.gridSize);
+                    const xMin = Math.max(0, cx - radPx);
+                    const xMax = Math.min(this.config.gridSize - 1, cx + radPx);
+                    const yMin = Math.max(0, cy - radPx);
+                    const yMax = Math.min(this.config.gridSize - 1, cy + radPx);
+                    const x0 = Math.floor(xMin / tileSize) * tileSize;
+                    const x1 = Math.floor(xMax / tileSize) * tileSize;
+                    const y0 = Math.floor(yMin / tileSize) * tileSize;
+                    const y1 = Math.floor(yMax / tileSize) * tileSize;
+
+                    for (let ty = y0; ty <= y1; ty += tileSize) {
+                        for (let tx = x0; tx <= x1; tx += tileSize) {
+                            this.obstacleSplatTile.uniforms.tileOrigin.value.set(tx, ty);
+                            this.renderer.compute(this.obstacleSplatTile.compute);
+                        }
+                    }
+                }
+
+                // Temperature splat (if enabled and temperature specified)
+                if (this.config.temperatureEnabled && this.fields.has('temperature') && this.tempSplat && splat.temperature !== undefined && splat.temperature > 0) {
+                    const isTempA = this.fields.getState('temperature');
+                    const tempSplat = isTempA ? this.tempSplat.aToB : this.tempSplat.bToA;
+                    tempSplat.uniforms.splatPos.value.set(x, y);
+                    tempSplat.uniforms.temperature.value = splat.temperature;
+                    tempSplat.uniforms.radius.value = dyeRadius ?? this.config.dyeRadius;
+                    tempSplat.uniforms.softness.value = softness;
+                    tempSplat.uniforms.falloff.value = falloff;
+                    tempSplat.uniforms.blendMode.value = blendMode;
+                    this.renderer.compute(tempSplat.compute);
+                    this.fields.swap('temperature');
+                }
+
+            }
+
+            // Update queue state and return
+            this.splatQueueExpandedStart += toProcess;
+            if (this.splatQueueExpandedStart >= this.splatQueueExpanded.length) {
+                this.splatQueueExpanded = [];
+                this.splatQueueExpandedStart = 0;
+            }
+            return;
+        }
+
+        // ============================================
+        // Per-Splat Mode (Tiled or Ping-Pong)
+        // ============================================
         for (let i = 0; i < toProcess; i++) {
             const splat = this.splatQueueExpanded[this.splatQueueExpandedStart + i];
 
@@ -998,35 +1744,154 @@ export class FluidSolver2D {
             const falloff = splat.splatFalloff ?? this.config.splatFalloff ?? this.config.splatQuality ?? 2;
             const blendMode = splat.splatBlendMode ?? this.config.splatBlendMode ?? 0;
 
-            // Velocity splat (ping-pong)
-            const isVelA = this.fields.getState('velocity');
-            const velocitySplat = isVelA ? this.velocitySplat.aToB : this.velocitySplat.bToA;
-            velocitySplat.uniforms.splatPos.value.set(x, y);
-            velocitySplat.uniforms.splatVel.value.set(splat.dx * velScale, dy * velScale);
-            velocitySplat.uniforms.radius.value = velRadius ?? this.config.velocityRadius;
-            velocitySplat.uniforms.softness.value = softness;
-            velocitySplat.uniforms.falloff.value = falloff;
-            velocitySplat.uniforms.blendMode.value = blendMode;
-            this.renderer.compute(velocitySplat.compute);
-            this.fields.swap('velocity');
+            if (this.config.splatTiledEnabled) {
+                // Velocity splat (tiled, in-place)
+                {
+                    const isVelA = this.fields.getState('velocity');
+                    const velocitySplat = isVelA ? this.velocitySplatTile.fromA : this.velocitySplatTile.fromB;
+                    const tileSize = this.velocitySplatTile.tileSize;
+                    const radius = velRadius ?? this.config.velocityRadius;
+                    const cutoffDistSq = cutoffDistSqFromRadius(radius, softness, falloff);
 
-            // Dye splat (ping-pong)
-            const isDyeA = this.fields.getState('dye');
-            const dyeSplat = isDyeA ? this.dyeSplat.aToB : this.dyeSplat.bToA;
-            dyeSplat.uniforms.splatPos.value.set(x, y);
-            dyeSplat.uniforms.splatVel.value.set(splat.dx * dyeScale, dy * dyeScale);
-            dyeSplat.uniforms.splatColor.value.set(
-                splat.color[0] * colorBoost,
-                splat.color[1] * colorBoost,
-                splat.color[2] * colorBoost,
-                1.0
-            );
-            dyeSplat.uniforms.radius.value = dyeRadius ?? this.config.dyeRadius;
-            dyeSplat.uniforms.softness.value = softness;
-            dyeSplat.uniforms.falloff.value = falloff;
-            dyeSplat.uniforms.blendMode.value = blendMode;
-            this.renderer.compute(dyeSplat.compute);
-            this.fields.swap('dye');
+                    velocitySplat.uniforms.splatPos.value.set(x, y);
+                    velocitySplat.uniforms.splatVel.value.set(splat.dx * velScale, dy * velScale);
+                    velocitySplat.uniforms.radius.value = radius;
+                    velocitySplat.uniforms.softness.value = softness;
+                    velocitySplat.uniforms.falloff.value = falloff;
+                    velocitySplat.uniforms.blendMode.value = blendMode;
+                    velocitySplat.uniforms.cutoffDistSq!.value = cutoffDistSq;
+
+                    const cx = Math.floor(x * this.config.gridSize);
+                    const cy = Math.floor(y * this.config.gridSize);
+                    const radPx = Math.ceil(Math.sqrt(cutoffDistSq) * this.config.gridSize);
+                    const xMin = Math.max(0, cx - radPx);
+                    const xMax = Math.min(this.config.gridSize - 1, cx + radPx);
+                    const yMin = Math.max(0, cy - radPx);
+                    const yMax = Math.min(this.config.gridSize - 1, cy + radPx);
+                    const x0 = Math.floor(xMin / tileSize) * tileSize;
+                    const x1 = Math.floor(xMax / tileSize) * tileSize;
+                    const y0 = Math.floor(yMin / tileSize) * tileSize;
+                    const y1 = Math.floor(yMax / tileSize) * tileSize;
+
+                    for (let ty = y0; ty <= y1; ty += tileSize) {
+                        for (let tx = x0; tx <= x1; tx += tileSize) {
+                            velocitySplat.uniforms.tileOrigin!.value.set(tx, ty);
+                            this.renderer.compute(velocitySplat.compute);
+                        }
+                    }
+                }
+
+                // Dye splat (tiled, in-place)
+                {
+                    const isDyeA = this.fields.getState('dye');
+                    const dyeSplat = isDyeA ? this.dyeSplatTile.fromA : this.dyeSplatTile.fromB;
+                    const tileSize = this.dyeSplatTile.tileSize;
+                    const radius = dyeRadius ?? this.config.dyeRadius;
+                    const cutoffDistSq = cutoffDistSqFromRadius(radius, softness, falloff);
+
+                    dyeSplat.uniforms.splatPos.value.set(x, y);
+                    dyeSplat.uniforms.splatVel.value.set(splat.dx * dyeScale, dy * dyeScale);
+                    dyeSplat.uniforms.splatColor.value.set(
+                        splat.color[0] * colorBoost,
+                        splat.color[1] * colorBoost,
+                        splat.color[2] * colorBoost,
+                        1.0
+                    );
+                    dyeSplat.uniforms.radius.value = radius;
+                    dyeSplat.uniforms.softness.value = softness;
+                    dyeSplat.uniforms.falloff.value = falloff;
+                    dyeSplat.uniforms.blendMode.value = blendMode;
+                    dyeSplat.uniforms.cutoffDistSq!.value = cutoffDistSq;
+
+                    const cx = Math.floor(x * this.config.dyeSize);
+                    const cy = Math.floor(y * this.config.dyeSize);
+                    const radPx = Math.ceil(Math.sqrt(cutoffDistSq) * this.config.dyeSize);
+                    const xMin = Math.max(0, cx - radPx);
+                    const xMax = Math.min(this.config.dyeSize - 1, cx + radPx);
+                    const yMin = Math.max(0, cy - radPx);
+                    const yMax = Math.min(this.config.dyeSize - 1, cy + radPx);
+                    const x0 = Math.floor(xMin / tileSize) * tileSize;
+                    const x1 = Math.floor(xMax / tileSize) * tileSize;
+                    const y0 = Math.floor(yMin / tileSize) * tileSize;
+                    const y1 = Math.floor(yMax / tileSize) * tileSize;
+
+                    for (let ty = y0; ty <= y1; ty += tileSize) {
+                        for (let tx = x0; tx <= x1; tx += tileSize) {
+                            dyeSplat.uniforms.tileOrigin!.value.set(tx, ty);
+                            this.renderer.compute(dyeSplat.compute);
+                        }
+                    }
+                }
+            } else {
+                // Velocity splat (ping-pong)
+                const isVelA = this.fields.getState('velocity');
+                const velocitySplat = isVelA ? this.velocitySplat.aToB : this.velocitySplat.bToA;
+                velocitySplat.uniforms.splatPos.value.set(x, y);
+                velocitySplat.uniforms.splatVel.value.set(splat.dx * velScale, dy * velScale);
+                velocitySplat.uniforms.radius.value = velRadius ?? this.config.velocityRadius;
+                velocitySplat.uniforms.softness.value = softness;
+                velocitySplat.uniforms.falloff.value = falloff;
+                velocitySplat.uniforms.blendMode.value = blendMode;
+                this.renderer.compute(velocitySplat.compute);
+                this.fields.swap('velocity');
+
+                // Dye splat (ping-pong)
+                const isDyeA = this.fields.getState('dye');
+                const dyeSplat = isDyeA ? this.dyeSplat.aToB : this.dyeSplat.bToA;
+                dyeSplat.uniforms.splatPos.value.set(x, y);
+                dyeSplat.uniforms.splatVel.value.set(splat.dx * dyeScale, dy * dyeScale);
+                dyeSplat.uniforms.splatColor.value.set(
+                    splat.color[0] * colorBoost,
+                    splat.color[1] * colorBoost,
+                    splat.color[2] * colorBoost,
+                    1.0
+                );
+                dyeSplat.uniforms.radius.value = dyeRadius ?? this.config.dyeRadius;
+                dyeSplat.uniforms.softness.value = softness;
+                dyeSplat.uniforms.falloff.value = falloff;
+                dyeSplat.uniforms.blendMode.value = blendMode;
+                this.renderer.compute(dyeSplat.compute);
+                this.fields.swap('dye');
+            }
+
+            // Obstacle splat (always uses tiled in-place updates)
+            if (splat.obstacle !== undefined && this.obstacleSplatTile) {
+                const obstacleMode = Math.max(0, Math.min(1, Math.round(splat.obstacleMode ?? 0)));
+                const obstacleBlendMode = Math.max(0, Math.min(2, Math.round(splat.obstacleBlendMode ?? 1)));
+                const obstacleValue = Math.max(0, Math.min(1, splat.obstacle));
+
+                const tileSize = this.obstacleSplatTile.tileSize as number;
+                const radius = (splat.radius ?? this.config.dyeRadius) * (splat.radiusScale ?? 1.0);
+                const cutoffDistSq = cutoffDistSqFromRadius(radius, softness, falloff);
+
+                this.obstacleSplatTile.uniforms.splatPos.value.set(x, y);
+                this.obstacleSplatTile.uniforms.obstacleValue.value = obstacleValue;
+                this.obstacleSplatTile.uniforms.radius.value = radius;
+                this.obstacleSplatTile.uniforms.softness.value = softness;
+                this.obstacleSplatTile.uniforms.falloff.value = falloff;
+                this.obstacleSplatTile.uniforms.mode.value = obstacleMode;
+                this.obstacleSplatTile.uniforms.blendMode.value = obstacleBlendMode;
+                this.obstacleSplatTile.uniforms.cutoffDistSq.value = cutoffDistSq;
+
+                const cx = Math.floor(x * this.config.gridSize);
+                const cy = Math.floor(y * this.config.gridSize);
+                const radPx = Math.ceil(Math.sqrt(cutoffDistSq) * this.config.gridSize);
+                const xMin = Math.max(0, cx - radPx);
+                const xMax = Math.min(this.config.gridSize - 1, cx + radPx);
+                const yMin = Math.max(0, cy - radPx);
+                const yMax = Math.min(this.config.gridSize - 1, cy + radPx);
+                const x0 = Math.floor(xMin / tileSize) * tileSize;
+                const x1 = Math.floor(xMax / tileSize) * tileSize;
+                const y0 = Math.floor(yMin / tileSize) * tileSize;
+                const y1 = Math.floor(yMax / tileSize) * tileSize;
+
+                for (let ty = y0; ty <= y1; ty += tileSize) {
+                    for (let tx = x0; tx <= x1; tx += tileSize) {
+                        this.obstacleSplatTile.uniforms.tileOrigin.value.set(tx, ty);
+                        this.renderer.compute(this.obstacleSplatTile.compute);
+                    }
+                }
+            }
 
             // Temperature splat (if enabled and temperature specified)
             if (this.config.temperatureEnabled && this.fields.has('temperature') && this.tempSplat && splat.temperature !== undefined && splat.temperature > 0) {
@@ -1040,6 +1905,19 @@ export class FluidSolver2D {
                 tempSplat.uniforms.blendMode.value = blendMode;
                 this.renderer.compute(tempSplat.compute);
                 this.fields.swap('temperature');
+            }
+
+            // Fuel splat (if enabled and fuel specified)
+            if ((this.config.fuelEnabled ?? false) && this.fields.has('fuel') && this.fuelSplat && splat.fuel !== undefined && splat.fuel > 0) {
+                const fuel = this.fields.getState('fuel') ? this.fuelSplat.aToB : this.fuelSplat.bToA;
+                fuel.uniforms.splatPos.value.set(x, y);
+                fuel.uniforms.fuel.value = splat.fuel;
+                fuel.uniforms.radius.value = dyeRadius ?? this.config.dyeRadius;
+                fuel.uniforms.softness.value = softness;
+                fuel.uniforms.falloff.value = falloff;
+                fuel.uniforms.blendMode.value = blendMode;
+                this.renderer.compute(fuel.compute);
+                this.fields.swap('fuel');
             }
         }
 
@@ -1250,9 +2128,21 @@ export class FluidSolver2D {
         return this.fields.getRead('vorticity');
     }
 
+    /** Obstacle mask field (0=fluid, 1=solid). */
+    getObstaclesTexture(): THREE.StorageTexture {
+        return this.fields.getRead('obstacles');
+    }
+
+    /** Clears obstacles (sets the obstacle field to 0 everywhere). */
+    clearObstacles(): void {
+        if (!this.obstaclesClearCompute) return;
+        this.renderer.compute(this.obstaclesClearCompute);
+    }
+
     /** Temperature field (if enabled). Returns null if temperature is disabled. */
     getTemperatureTexture(): THREE.StorageTexture | null {
-        if (!this.fields.has('temperature')) return null;
+        if (!(this.config.temperatureEnabled ?? false)) return null;
+        if (!this.fields.isAllocated('temperature')) return null;
         return this.fields.getRead('temperature');
     }
 
@@ -1266,15 +2156,58 @@ export class FluidSolver2D {
     }
 
     setConfig(config: Partial<FluidConfig2D>): void {
-        const next = { ...this.config, ...config };
+        const prev = this.config;
+        const next = { ...prev, ...config };
         const needsResize =
-            next.gridSize !== this.config.gridSize ||
-            next.dyeSize !== this.config.dyeSize;
+            next.gridSize !== prev.gridSize ||
+            next.dyeSize !== prev.dyeSize;
 
         this.config = next;
 
         if (needsResize) {
             this.rebuildTextures();
+            return;
+        }
+
+        // Splat batch compute depends on max count and enable state.
+        const needsSplatBatchRebuild =
+            (next.splatBatchEnabled ?? false) !== (prev.splatBatchEnabled ?? false) ||
+            (next.splatBatchMaxCount ?? 256) !== (prev.splatBatchMaxCount ?? 256);
+
+        if (needsSplatBatchRebuild) {
+            const gridSize = this.config.gridSize;
+            const dyeSize = this.config.dyeSize;
+            const vel = this.fields.getBoth('velocity');
+            const dye = this.fields.getBoth('dye');
+
+            if (this.config.splatBatchEnabled) {
+                this.velocitySplatBatch = {
+                    aToB: createBatchedVelocitySplatNode(vel.a, vel.b, gridSize, gridSize, this.config.splatBatchMaxCount),
+                    bToA: createBatchedVelocitySplatNode(vel.b, vel.a, gridSize, gridSize, this.config.splatBatchMaxCount),
+                };
+                this.dyeSplatBatch = {
+                    aToB: createBatchedDyeSplatNode(dye.a, dye.b, dyeSize, dyeSize, this.config.splatBatchMaxCount),
+                    bToA: createBatchedDyeSplatNode(dye.b, dye.a, dyeSize, dyeSize, this.config.splatBatchMaxCount),
+                };
+            } else {
+                this.velocitySplatBatch = null;
+                this.dyeSplatBatch = null;
+            }
+        }
+
+        // Fuel system: initialize nodes when enabled (temperature must exist for combustion).
+        const fuelOn = next.fuelEnabled ?? false;
+        const fuelWasOn = prev.fuelEnabled ?? false;
+        if (fuelOn && !fuelWasOn) {
+            if (!this.fuelAdvect || !this.fuelSplat) this.initializeFuel();
+        }
+
+        const tempOn = next.temperatureEnabled ?? false;
+        const tempWasOn = prev.temperatureEnabled ?? false;
+        if (tempOn && !tempWasOn) {
+            this.initializeTemperature();
+            // Rebuild temperature-dependent obstacle enforcement and fuel/combustion nodes.
+            this.initializeComputeNodes();
         }
     }
 
@@ -1293,6 +2226,30 @@ export class FluidSolver2D {
 
     getPerfStats(): PerfStats2D | null {
         return this.perfStats;
+    }
+
+    getFieldMemoryStats(): FieldMemoryStats {
+        return this.fields.getMemoryStats();
+    }
+
+    getPassGraphMetadata(): PassMetadata[] {
+        return this.graph.getPassMetadata();
+    }
+
+    getPassTimings(): PassTiming[] {
+        return this.graph.getTimings();
+    }
+
+    getFieldCount(): number {
+        return this.fields.getFieldIds().length;
+    }
+
+    setPassEnabled(id: string, enabled: boolean): void {
+        this.graph.setEnabled(id, enabled);
+    }
+
+    setPassGroupEnabled(group: PassGroup, enabled: boolean): void {
+        this.graph.setGroupEnabled(group, enabled);
     }
 
     isRunning(): boolean {

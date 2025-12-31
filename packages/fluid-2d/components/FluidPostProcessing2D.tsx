@@ -4,7 +4,7 @@ import { useFrame, useThree } from '@react-three/fiber';
 import type { RenderOutput2DConfig } from '../render/RenderOutput2D';
 import { createFallbackLut3DTexture } from '../render/Lut3D';
 import { useLut3DTexture } from '../render/useLut3DTexture';
-import { PostFXPipeline2D } from '../postfx/PostFXPipeline2D';
+import { PostFXPipelineV3 } from '../postfx/PostFXPipelineV3';
 
 import { FluidSolver2D } from '../FluidSolver2D';
 
@@ -14,10 +14,10 @@ export interface FluidPostProcessing2DProps {
 }
 
 export function FluidPostProcessing2D({ postConfig, solver }: FluidPostProcessing2DProps) {
-  const { gl, scene, camera } = useThree();
+  const { gl, scene, camera, size } = useThree();
 
   const postRef = useRef<THREE.PostProcessing | null>(null);
-  const pipelineRef = useRef<PostFXPipeline2D | null>(null);
+  const pipelineRef = useRef<PostFXPipelineV3 | null>(null);
   const [outputNode, setOutputNode] = useState<any>(null);
 
   const lutFallback3D = useMemo(() => createFallbackLut3DTexture(2), []);
@@ -35,7 +35,7 @@ export function FluidPostProcessing2D({ postConfig, solver }: FluidPostProcessin
 
   useEffect(() => {
     pipelineRef.current?.dispose();
-    pipelineRef.current = new PostFXPipeline2D(scene as any, camera as any, lutFallback3D);
+    pipelineRef.current = new PostFXPipelineV3(scene as any, camera as any, lutFallback3D);
     setOutputNode(null);
 
     return () => {
@@ -47,15 +47,21 @@ export function FluidPostProcessing2D({ postConfig, solver }: FluidPostProcessin
   useEffect(() => {
     if (!pipelineRef.current) return;
 
+    const pixelRatio = (gl as any)?.getPixelRatio?.() ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 1);
+    const width = Math.max(1, Math.floor(size.width * pixelRatio));
+    const height = Math.max(1, Math.floor(size.height * pixelRatio));
+
     const { outputNode: out } = pipelineRef.current.update(postConfig, {
       lutFallback3D,
       lutTexture3D: lut3d.texture3D,
       lutSize: lut3d.size,
       velocityTexture: solver?.getVelocityTexture() ?? null,
+      width,
+      height,
     });
 
     setOutputNode((prev: any) => (prev === out ? prev : out));
-  }, [postConfig, lutFallback3D, lut3d.texture3D, lut3d.size]);
+  }, [postConfig, lutFallback3D, lut3d.texture3D, lut3d.size, solver, gl, size.width, size.height]);
 
   useEffect(() => {
     if (!postEnabled) return;
@@ -86,11 +92,16 @@ export function FluidPostProcessing2D({ postConfig, solver }: FluidPostProcessin
   // Render post stack (priority=1 disables R3F's default renderer.render(scene,camera))
   useFrame(() => {
     if (postEnabled && pipelineRef.current && solver) {
+      const pixelRatio = (gl as any)?.getPixelRatio?.() ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 1);
+      const width = Math.max(1, Math.floor(size.width * pixelRatio));
+      const height = Math.max(1, Math.floor(size.height * pixelRatio));
       pipelineRef.current.renderTick({
         lutFallback3D,
         lutTexture3D: lut3d.texture3D,
         lutSize: lut3d.size,
-        velocityTexture: solver.getVelocityTexture()
+        velocityTexture: solver.getVelocityTexture(),
+        width,
+        height,
       });
     }
 

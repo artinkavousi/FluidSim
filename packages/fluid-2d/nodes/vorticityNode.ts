@@ -21,6 +21,7 @@ import {
     max,
     min,
     select,
+    clamp,
 } from 'three/tsl';
 import * as THREE from 'three/webgpu';
 
@@ -31,7 +32,7 @@ export interface VorticityCompute {
 
 export interface VorticityForceCompute {
     compute: any;
-    uniforms: { vorticityStrength: any; dt: any; solid: any };
+    uniforms: { vorticityStrength: any; dt: any; solid: any; edgeAwareEnabled: any; edgeAwareStrength: any; scaleMix: any };
 }
 
 /**
@@ -87,11 +88,15 @@ export function createVorticityForceNode(
     vorticityTex: THREE.StorageTexture,
     velocityWriteTex: THREE.StorageTexture,
     width: number,
-    height: number
+    height: number,
+    obstaclesTex: THREE.StorageTexture
 ): VorticityForceCompute {
     const vorticityStrength = uniform(30.0);
     const dt = uniform(1.0 / 60.0);
     const solid = uniform(0);
+    const edgeAwareEnabled = uniform(0);
+    const edgeAwareStrength = uniform(1.0);
+    const scaleMix = uniform(0.0);
 
     const vortForceFn = Fn(() => {
         const idx = instanceIndex;
@@ -109,6 +114,11 @@ export function createVorticityForceNode(
         const yB = max(y.sub(1), int(0));
         const yT = min(y.add(1), int(height - 1));
 
+        const xL2 = max(x.sub(2), int(0));
+        const xR2 = min(x.add(2), int(width - 1));
+        const yB2 = max(y.sub(2), int(0));
+        const yT2 = min(y.add(2), int(height - 1));
+
         const wL = abs(textureLoad(vorticityTex, ivec2(xL, y)).x);
         const wR = abs(textureLoad(vorticityTex, ivec2(xR, y)).x);
         const wB = abs(textureLoad(vorticityTex, ivec2(x, yB)).x);
@@ -124,13 +134,42 @@ export function createVorticityForceNode(
         const nx = gradX.div(len);
         const ny = gradY.div(len);
 
+        // Larger-scale gradient (2-cell central difference), blended in via `scaleMix`.
+        const wL2 = abs(textureLoad(vorticityTex, ivec2(xL2, y)).x);
+        const wR2 = abs(textureLoad(vorticityTex, ivec2(xR2, y)).x);
+        const wB2 = abs(textureLoad(vorticityTex, ivec2(x, yB2)).x);
+        const wT2 = abs(textureLoad(vorticityTex, ivec2(x, yT2)).x);
+
+        const gradX2 = float(0.25).mul(wR2.sub(wL2));
+        const gradY2 = float(0.25).mul(wT2.sub(wB2));
+
+        const len2 = sqrt(gradX2.mul(gradX2).add(gradY2.mul(gradY2))).add(float(0.0001));
+        const nx2 = gradX2.div(len2);
+        const ny2 = gradY2.div(len2);
+
         // Force = strength * (N × ω) * dt / gridSize
         const scale = vorticityStrength.mul(dt).div(float(width));
-        const forceX = ny.mul(wC).mul(scale);
-        const forceY = nx.negate().mul(wC).mul(scale);
+        const fX0 = ny.mul(wC).mul(scale);
+        const fY0 = nx.negate().mul(wC).mul(scale);
+        const fX1 = ny2.mul(wC).mul(scale);
+        const fY1 = nx2.negate().mul(wC).mul(scale);
+
+        const mixV = clamp(scaleMix, float(0.0), float(1.0));
+        const forceX = fX0.mul(float(1.0).sub(mixV)).add(fX1.mul(mixV));
+        const forceY = fY0.mul(float(1.0).sub(mixV)).add(fY1.mul(mixV));
+
+        const edgeOn = int(edgeAwareEnabled).equal(int(1));
+        const oC = textureLoad(obstaclesTex, coord).x;
+        const oL = textureLoad(obstaclesTex, ivec2(xL, y)).x;
+        const oR = textureLoad(obstaclesTex, ivec2(xR, y)).x;
+        const oB = textureLoad(obstaclesTex, ivec2(x, yB)).x;
+        const oT = textureLoad(obstaclesTex, ivec2(x, yT)).x;
+        const nearSolid = max(max(max(oC, oL), max(oR, oB)), oT);
+        const atten = float(1.0).sub(clamp(nearSolid.mul(edgeAwareStrength), float(0.0), float(1.0)));
+        const att = select(edgeOn, atten, float(1.0));
 
         const vel = textureLoad(velocityReadTex, coord);
-        const newVel = vel.xy.add(vec2(forceX, forceY));
+        const newVel = vel.xy.add(vec2(forceX, forceY).mul(att));
         const outVel = select(solidOn.and(isEdge), vec2(float(0.0), float(0.0)), newVel);
 
         textureStore(velocityWriteTex, coord, vec4(outVel, float(0), float(1))).toWriteOnly();
@@ -138,6 +177,6 @@ export function createVorticityForceNode(
 
     return {
         compute: vortForceFn().compute(width * height),
-        uniforms: { vorticityStrength, dt, solid }
+        uniforms: { vorticityStrength, dt, solid, edgeAwareEnabled, edgeAwareStrength, scaleMix }
     };
 }

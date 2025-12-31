@@ -3,12 +3,12 @@
  * Buoyancy TSL Node - Dye-density driven vertical force
  */
 
-import { Fn, float, int, ivec2, instanceIndex, textureLoad, textureStore, vec4, uniform, max, min } from 'three/tsl';
+import { Fn, float, int, ivec2, instanceIndex, textureLoad, textureStore, vec3, vec4, uniform, max, min, clamp } from 'three/tsl';
 import * as THREE from 'three/webgpu';
 
 export interface BuoyancyCompute {
   compute: any;
-  uniforms: { strength: any; ambient: any; dt: any };
+  uniforms: { strength: any; ambient: any; dt: any; weights: any };
 }
 
 export function createBuoyancyNode(
@@ -23,6 +23,7 @@ export function createBuoyancyNode(
   const strength = uniform(0.0);
   const ambient = uniform(0.0);
   const dt = uniform(1.0 / 60.0);
+  const weights = uniform(vec3(0.3333333, 0.3333333, 0.3333333));
 
   const buoyancyFn = Fn(() => {
     const idx = instanceIndex;
@@ -37,7 +38,8 @@ export function createBuoyancyNode(
     const dyeY = max(int(0), min(dy, int(dyeHeight - 1)));
 
     const dye = textureLoad(dyeTex, ivec2(dyeX, dyeY)).xyz;
-    const density = dye.x.add(dye.y).add(dye.z).mul(0.3333333);
+    const w = clamp(weights, vec3(0.0, 0.0, 0.0), vec3(10.0, 10.0, 10.0));
+    const density = dye.x.mul(w.x).add(dye.y.mul(w.y)).add(dye.z.mul(w.z));
 
     // Y-down velocity: buoyancy pushes upward => negative Y.
     const f = density.sub(ambient).mul(strength).mul(dt);
@@ -50,7 +52,6 @@ export function createBuoyancyNode(
 
   return {
     compute: buoyancyFn().compute(width * height),
-    uniforms: { strength, ambient, dt },
+    uniforms: { strength, ambient, dt, weights },
   };
 }
-

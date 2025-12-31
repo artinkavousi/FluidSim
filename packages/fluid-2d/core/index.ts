@@ -6,3 +6,4 @@
 export * from './PingPongBuffer';
 export * from './PassGraph';
 export * from './FieldRegistry';
+export * from './ComputeNodeRegistry';

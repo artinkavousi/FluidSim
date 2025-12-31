@@ -5,28 +5,26 @@
  */
 
 import React, { useState, useMemo, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { emitterTypeColors } from '../ui';
+import { AnimatePresence, motion } from 'framer-motion';
 import { useStudioStore } from '../store';
+import { emitterTypeColors } from '../ui';
 import type {
-  Emitter, EmitterType, DirectionMode,
-  LineEmitter, CircleEmitter, CurveEmitter, TextEmitter, SVGEmitter, BrushEmitter
+  BrushEmitter,
+  CircleEmitter,
+  CurveEmitter,
+  DirectionMode,
+  Emitter,
+  EmitterType,
+  LineEmitter,
+  SVGEmitter,
+  TextEmitter,
 } from '../../fluid-2d/emitters/types';
-import type { Color3 } from '../../fluid-2d/types';
+import { getPreset, getPresetNames } from '../../fluid-2d/emitters/presets';
 import { defaultPostFxOrder, sanitizePostFxOrder, type PostFxEffectId, type RenderOutput2DConfig } from '../../fluid-2d/render/RenderOutput2D';
-import { getPresetNames, getPreset } from '../../fluid-2d/emitters/presets';
-
-// ============================================
-// Utilities
-// ============================================
-
-const c3hex = (c: Color3): string =>
-  `#${[c[0], c[1], c[2]].map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('')}`;
-
-const hex2c3 = (h: string): Color3 => {
-  const x = h.replace('#', '');
-  return [parseInt(x.slice(0, 2), 16) / 255, parseInt(x.slice(2, 4), 16) / 255, parseInt(x.slice(4, 6), 16) / 255];
-};
+import { useFluid2DOptional } from '../../fluid-2d/components/FluidProvider2D';
+import { Chip, Color, Divider, Num, Select, Slider, Toggle } from './unified/controls';
+import { MaterialPresetPanel } from './MaterialPresetPanel';
+import { useMaterialPresetStore } from '../store/materialPresetStore';
 
 // ============================================
 // Types
@@ -42,75 +40,6 @@ interface UnifiedPanelProps {
   onUpdateEmitter: (id: string, updates: Partial<Emitter>) => void;
   onDuplicateEmitter: (id: string) => void;
 }
-
-// ============================================
-// Micro Controls
-// ============================================
-
-const Slider: React.FC<{
-  label: string; v: number; min: number; max: number; step?: number;
-  onChange: (v: number) => void; accent?: string; unit?: string;
-}> = ({ label, v, min, max, step = 0.01, onChange, accent = '#00e5cc', unit = '' }) => {
-  const pct = ((v - min) / (max - min)) * 100;
-  return (
-    <div className="ctrl-slider">
-      <div className="cs-head">
-        <span className="cs-label">{label}</span>
-        <span className="cs-val">{v.toFixed(step >= 1 ? 0 : step >= 0.1 ? 1 : 2)}{unit}</span>
-      </div>
-      <div className="cs-track">
-        <div className="cs-fill" style={{ width: `${pct}%`, background: accent }} />
-        <input type="range" min={min} max={max} step={step} value={v}
-          onChange={e => onChange(parseFloat(e.target.value))} />
-      </div>
-    </div>
-  );
-};
-
-const Num: React.FC<{
-  label: string; v: number; step?: number; onChange: (v: number) => void;
-}> = ({ label, v, step = 0.01, onChange }) => (
-  <div className="ctrl-num">
-    <span className="cn-label">{label}</span>
-    <input type="number" value={v.toFixed(step >= 1 ? 0 : 2)} step={step}
-      onChange={e => onChange(parseFloat(e.target.value) || 0)} />
-  </div>
-);
-
-const Toggle: React.FC<{
-  options: { l: string; v: any }[];
-  value: any; onChange: (v: any) => void; accent?: string;
-}> = ({ options, value, onChange, accent = '#00e5cc' }) => (
-  <div className="ctrl-toggle">
-    {options.map(o => (
-      <button key={String(o.v)} className={value === o.v ? 'active' : ''}
-        style={{ '--ta': accent } as React.CSSProperties}
-        onClick={() => onChange(o.v)}>{o.l}</button>
-    ))}
-  </div>
-);
-
-const Color: React.FC<{ c: Color3; onChange: (c: Color3) => void }> = ({ c, onChange }) => (
-  <div className="ctrl-color">
-    <input type="color" value={c3hex(c)} onChange={e => onChange(hex2c3(e.target.value))} />
-    <span>{c3hex(c).toUpperCase()}</span>
-  </div>
-);
-
-const Select: React.FC<{
-  value: string; options: { l: string; v: string }[]; onChange: (v: string) => void;
-}> = ({ value, options, onChange }) => (
-  <select className="ctrl-select" value={value} onChange={e => onChange(e.target.value)}>
-    {options.map(o => <option key={o.v} value={o.v}>{o.l}</option>)}
-  </select>
-);
-
-const Chip: React.FC<{
-  active?: boolean; onClick: () => void; children: React.ReactNode; accent?: string;
-}> = ({ active, onClick, children, accent = '#00e5cc' }) => (
-  <button className={`ctrl-chip ${active ? 'active' : ''}`}
-    style={{ '--ca': accent } as React.CSSProperties} onClick={onClick}>{children}</button>
-);
 
 const postFxLabel: Record<PostFxEffectId, string> = {
   grading: 'Grading',
@@ -152,17 +81,6 @@ function movePostFxOrder(order: PostFxEffectId[], id: PostFxEffectId, dir: -1 | 
   copy[next] = tmp;
   return copy;
 }
-
-// ============================================
-// Section Divider
-// ============================================
-
-const Divider: React.FC<{ children: React.ReactNode; accent?: string }> = ({ children, accent = '#00e5cc' }) => (
-  <div className="divider" style={{ '--da': accent } as React.CSSProperties}>
-    <span>{children}</span>
-    <div className="div-line" />
-  </div>
-);
 
 // ============================================
 // Emitter Card - Full Inline Properties
@@ -477,12 +395,30 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
   const setMouseEnabled = useStudioStore(s => s.setMouseEnabled);
   const mouseHoverMode = useStudioStore(s => s.mouseHoverMode);
   const setMouseHoverMode = useStudioStore(s => s.setMouseHoverMode);
+  const mouseTool = useStudioStore(s => s.mouseTool);
+  const setMouseTool = useStudioStore(s => s.setMouseTool);
   const activePanelSection = useStudioStore(s => s.activePanelSection);
   const setActivePanelSection = useStudioStore(s => s.setActivePanelSection);
   const canUndo = useStudioStore(s => s.canUndo);
   const canRedo = useStudioStore(s => s.canRedo);
   const undo = useStudioStore(s => s.undo);
   const redo = useStudioStore(s => s.redo);
+
+  const fluid = useFluid2DOptional();
+  const solver = fluid?.solver ?? null;
+  const fieldMemory = useMemo(() => solver?.getFieldMemoryStats?.() ?? null, [solver, config.gridSize, config.dyeSize]);
+  const passMeta = useMemo(() => solver?.getPassGraphMetadata?.() ?? null, [solver]);
+  const vramLabel = useMemo(() => {
+    if (!fieldMemory) return '--';
+    const usedMb = fieldMemory.allocatedBytes / (1024 * 1024);
+    const estMb = fieldMemory.estimatedBytes / (1024 * 1024);
+    return `${usedMb.toFixed(1)}/${estMb.toFixed(1)} MB`;
+  }, [fieldMemory]);
+  const passesLabel = useMemo(() => {
+    if (!passMeta) return '--';
+    const enabled = passMeta.reduce((acc, p) => acc + (p.enabled ? 1 : 0), 0);
+    return `${enabled}/${passMeta.length}`;
+  }, [passMeta]);
 
   // Track which emitters are expanded (all by default if few, or first one)
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -683,14 +619,40 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                 >
                   Perf {(config.perfEnabled ?? false) ? 'On' : 'Off'}
                 </Chip>
+                <Chip
+                  active={config.splatTiledEnabled ?? true}
+                  onClick={() => setFluidConfig({ splatTiledEnabled: !(config.splatTiledEnabled ?? true) })}
+                  accent="#22c55e"
+                >
+                  Splat Tiles {(config.splatTiledEnabled ?? true) ? 'On' : 'Off'}
+                </Chip>
+                <Chip
+                  active={config.splatBatchEnabled ?? false}
+                  onClick={() => setFluidConfig({ splatBatchEnabled: !(config.splatBatchEnabled ?? false) })}
+                  accent="#22c55e"
+                >
+                  Splat Batch {(config.splatBatchEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
                 <span className="gg-label">FPS {Number.isFinite(fps) ? fps.toFixed(0) : '--'}</span>
                 <span className="gg-label">Frame {perf ? `${perf.frameMs.toFixed(2)}ms` : '--'}</span>
                 <span className="gg-label">Sub {perf ? `${perf.substeps}` : '--'}</span>
               </div>
+              <div className="gg-row inline">
+                <span className="gg-label">VRAM {vramLabel}</span>
+                <span className="gg-label">Passes {passesLabel}</span>
+              </div>
               <div className="gg-row r2">
                 <Slider label="Max Splats" v={config.maxSplatsPerFrame ?? 32} min={0} max={256} step={1}
                   onChange={v => setFluidConfig({ maxSplatsPerFrame: v })} accent="#22c55e" />
-                <div />
+                <Slider
+                  label="Batch Max"
+                  v={config.splatBatchMaxCount ?? 256}
+                  min={32}
+                  max={2048}
+                  step={32}
+                  onChange={v => setFluidConfig({ splatBatchMaxCount: v })}
+                  accent="#22c55e"
+                />
               </div>
               {(config.perfEnabled ?? false) && (
                 <>
@@ -783,13 +745,54 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
               </div>
               <div className="gg-row inline">
                 <Chip
+                  active={config.macGridEnabled ?? false}
+                  onClick={() => setFluidConfig({ macGridEnabled: !(config.macGridEnabled ?? false) })}
+                  accent="#60a5fa"
+                >
+                  MAC {(config.macGridEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
+              </div>
+              <div className="gg-row inline">
+                <Chip
+                  active={config.vorticityEdgeAwareEnabled ?? false}
+                  onClick={() => setFluidConfig({ vorticityEdgeAwareEnabled: !(config.vorticityEdgeAwareEnabled ?? false) })}
+                  accent="#60a5fa"
+                >
+                  Edge-Aware {(config.vorticityEdgeAwareEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
+              </div>
+              <div className="gg-row r2">
+                <Slider label="Edge Str" v={config.vorticityEdgeAwareStrength ?? 1.0} min={0} max={2} step={0.01}
+                  onChange={v => setFluidConfig({ vorticityEdgeAwareStrength: v })} accent="#60a5fa" />
+                <Slider label="Scale Mix" v={config.vorticityScaleMix ?? 0.0} min={0} max={1} step={0.01}
+                  onChange={v => setFluidConfig({ vorticityScaleMix: v })} accent="#60a5fa" />
+              </div>
+              <div className="gg-row inline">
+                <Chip
                   active={config.pressureAdaptive ?? true}
                   onClick={() => setFluidConfig({ pressureAdaptive: !(config.pressureAdaptive ?? true) })}
                   accent="#60a5fa"
                 >
                   Adaptive It {(config.pressureAdaptive ?? true) ? 'On' : 'Off'}
                 </Chip>
+                <Chip
+                  active={config.pressureMultigridEnabled ?? false}
+                  onClick={() => setFluidConfig({ pressureMultigridEnabled: !(config.pressureMultigridEnabled ?? false) })}
+                  accent="#60a5fa"
+                >
+                  V-Cycle {(config.pressureMultigridEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
               </div>
+              {(config.pressureMultigridEnabled ?? false) && (
+                <div className="gg-row r3">
+                  <Slider label="Pre" v={config.pressureMultigridPreSmooth ?? 6} min={0} max={20} step={1}
+                    onChange={v => setFluidConfig({ pressureMultigridPreSmooth: v })} accent="#60a5fa" />
+                  <Slider label="Coarse" v={config.pressureMultigridCoarseIterations ?? 24} min={1} max={80} step={1}
+                    onChange={v => setFluidConfig({ pressureMultigridCoarseIterations: v })} accent="#60a5fa" />
+                  <Slider label="Post" v={config.pressureMultigridPostSmooth ?? 6} min={0} max={20} step={1}
+                    onChange={v => setFluidConfig({ pressureMultigridPostSmooth: v })} accent="#60a5fa" />
+                </div>
+              )}
               {(config.pressureAdaptive ?? true) && (
                 <div className="gg-row r2">
                   <Slider label="Min It" v={config.pressureMinIterations ?? 6} min={1} max={40} step={1}
@@ -884,6 +887,12 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                 <Chip active={config.temperatureEnabled ?? false} onClick={() => setFluidConfig({ temperatureEnabled: !(config.temperatureEnabled ?? false) })} accent="#f97316">
                   Temperature {config.temperatureEnabled ? 'On' : 'Off'}
                 </Chip>
+                <Chip active={config.fuelEnabled ?? false} onClick={() => setFluidConfig({ fuelEnabled: !(config.fuelEnabled ?? false) })} accent="#f97316">
+                  Fuel {(config.fuelEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
+                <Chip active={config.combustionEnabled ?? false} onClick={() => setFluidConfig({ combustionEnabled: !(config.combustionEnabled ?? false) })} accent="#f97316">
+                  Combust {(config.combustionEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
                 {config.temperatureEnabled && (
                   <Chip active={config.temperatureBuoyancyEnabled ?? false} onClick={() => setFluidConfig({ temperatureBuoyancyEnabled: !(config.temperatureBuoyancyEnabled ?? false) })} accent="#f97316">
                     Temp Buoyancy {config.temperatureBuoyancyEnabled ? 'On' : 'Off'}
@@ -908,6 +917,71 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                   )}
                 </>
               )}
+              {(config.fuelEnabled ?? false) && (
+                <div className="gg-row">
+                  <Slider label="Fuel Dissip" v={config.fuelDissipation ?? 0.99} min={0.9} max={1.0} step={0.0005}
+                    onChange={v => setFluidConfig({ fuelDissipation: v })} accent="#f97316" />
+                </div>
+              )}
+              {(config.combustionEnabled ?? false) && (
+                <>
+                  <div className="gg-row r2">
+                    <Slider label="Rate" v={config.combustionRate ?? 1.0} min={0} max={5} step={0.01}
+                      onChange={v => setFluidConfig({ combustionRate: v })} accent="#f97316" />
+                    <Slider label="Ignite" v={config.combustionIgniteTemp ?? 0.25} min={0} max={2} step={0.01}
+                      onChange={v => setFluidConfig({ combustionIgniteTemp: v })} accent="#f97316" />
+                  </div>
+                  <div className="gg-row r2">
+                    <Slider label="Heat/Fuel" v={config.combustionHeatPerFuel ?? 2.0} min={0} max={10} step={0.01}
+                      onChange={v => setFluidConfig({ combustionHeatPerFuel: v })} accent="#f97316" />
+                    <Slider label="Temp Damp" v={config.combustionTempDamp ?? 0.995} min={0.9} max={1.0} step={0.0005}
+                      onChange={v => setFluidConfig({ combustionTempDamp: v })} accent="#f97316" />
+                  </div>
+                  <div className="gg-row inline">
+                    <Chip active={config.fireDyeEnabled ?? true} onClick={() => setFluidConfig({ fireDyeEnabled: !(config.fireDyeEnabled ?? true) })} accent="#f97316">
+                      Fire Dye {(config.fireDyeEnabled ?? true) ? 'On' : 'Off'}
+                    </Chip>
+                  </div>
+                  {(config.fireDyeEnabled ?? true) && (
+                    <div className="gg-row r2">
+                      <Slider label="Fire Int" v={config.fireDyeIntensity ?? 0.25} min={0} max={2} step={0.01}
+                        onChange={v => setFluidConfig({ fireDyeIntensity: v })} accent="#f97316" />
+                      <Slider label="Fire T" v={config.fireDyeTempScale ?? 1.0} min={0} max={5} step={0.01}
+                        onChange={v => setFluidConfig({ fireDyeTempScale: v })} accent="#f97316" />
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Multiphase (RGB dye phases) */}
+            <div className="global-group">
+              <span className="gg-title">Multiphase</span>
+              <div className="gg-row inline">
+                <Chip active={config.multiphaseEnabled ?? false} onClick={() => setFluidConfig({ multiphaseEnabled: !(config.multiphaseEnabled ?? false) })} accent="#22c55e">
+                  Multiphase {(config.multiphaseEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
+              </div>
+              {(config.multiphaseEnabled ?? false) && (
+                <>
+                  <div className="gg-row r3">
+                    <Slider label="Dissip R" v={(config.multiphaseDyeDissipationRGB?.[0] ?? 1.0)} min={0.9} max={1.0} step={0.0005}
+                      onChange={v => setFluidConfig({ multiphaseDyeDissipationRGB: [v, config.multiphaseDyeDissipationRGB?.[1] ?? 1.0, config.multiphaseDyeDissipationRGB?.[2] ?? 1.0] })} accent="#ef4444" />
+                    <Slider label="Dissip G" v={(config.multiphaseDyeDissipationRGB?.[1] ?? 1.0)} min={0.9} max={1.0} step={0.0005}
+                      onChange={v => setFluidConfig({ multiphaseDyeDissipationRGB: [config.multiphaseDyeDissipationRGB?.[0] ?? 1.0, v, config.multiphaseDyeDissipationRGB?.[2] ?? 1.0] })} accent="#22c55e" />
+                    <Slider label="Dissip B" v={(config.multiphaseDyeDissipationRGB?.[2] ?? 1.0)} min={0.9} max={1.0} step={0.0005}
+                      onChange={v => setFluidConfig({ multiphaseDyeDissipationRGB: [config.multiphaseDyeDissipationRGB?.[0] ?? 1.0, config.multiphaseDyeDissipationRGB?.[1] ?? 1.0, v] })} accent="#3b82f6" />
+                  </div>
+                  <div className="gg-row r3">
+                    <Slider label="Buoy R" v={(config.multiphaseBuoyancyWeightsRGB?.[0] ?? 0.3333)} min={-2} max={2} step={0.01}
+                      onChange={v => setFluidConfig({ multiphaseBuoyancyWeightsRGB: [v, config.multiphaseBuoyancyWeightsRGB?.[1] ?? 0.3333, config.multiphaseBuoyancyWeightsRGB?.[2] ?? 0.3333] })} accent="#ef4444" />
+                    <Slider label="Buoy G" v={(config.multiphaseBuoyancyWeightsRGB?.[1] ?? 0.3333)} min={-2} max={2} step={0.01}
+                      onChange={v => setFluidConfig({ multiphaseBuoyancyWeightsRGB: [config.multiphaseBuoyancyWeightsRGB?.[0] ?? 0.3333, v, config.multiphaseBuoyancyWeightsRGB?.[2] ?? 0.3333] })} accent="#22c55e" />
+                    <Slider label="Buoy B" v={(config.multiphaseBuoyancyWeightsRGB?.[2] ?? 0.3333)} min={-2} max={2} step={0.01}
+                      onChange={v => setFluidConfig({ multiphaseBuoyancyWeightsRGB: [config.multiphaseBuoyancyWeightsRGB?.[0] ?? 0.3333, config.multiphaseBuoyancyWeightsRGB?.[1] ?? 0.3333, v] })} accent="#3b82f6" />
+                  </div>
+                </>
+              )}
             </div>
           </>
         )}
@@ -915,6 +989,16 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
         {activePanelSection === 'rendering' && (
           <>
             <Divider accent="#a78bfa">RENDER</Divider>
+
+            {/* Material Presets */}
+            <MaterialPresetPanel
+              activePresetId={useMaterialPresetStore.getState().activePresetId}
+              onPresetChange={(id) => useMaterialPresetStore.getState().setActivePreset(id)}
+              enabled={useMaterialPresetStore.getState().enabled}
+              onEnabledChange={(v) => useMaterialPresetStore.getState().setEnabled(v)}
+              params={useMaterialPresetStore.getState().params}
+              onParamChange={(id, val) => useMaterialPresetStore.getState().setParam(id, val)}
+            />
 
             <div className="global-group">
               <span className="gg-title">Output</span>
@@ -1001,6 +1085,20 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
 
               {(postConfig.postEnabled ?? false) && (
                 <>
+                  {(postConfig.postBackend ?? 0) === 1 && (
+                    <div className="gg-row r2">
+                      <Slider
+                        label="Post Scale"
+                        v={postConfig.postResolutionScale ?? 1.0}
+                        min={0.25}
+                        max={1.0}
+                        step={0.05}
+                        onChange={v => setPostConfig({ postResolutionScale: v })}
+                        accent="#a78bfa"
+                      />
+                      <div />
+                    </div>
+                  )}
                   <div className="gg-row r2">
                     <Slider label="Exposure" v={postConfig.exposure ?? 1.0} min={0.1} max={4.0} step={0.01}
                       onChange={v => setPostConfig({ exposure: v })} accent="#a78bfa" />
@@ -1096,6 +1194,25 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                         <span className="gg-label">Stack</span>
                         <Chip active={false} onClick={() => setPostConfig({ postFxOrder: [...defaultPostFxOrder] })} accent="#a78bfa">
                           Reset Order
+                        </Chip>
+                        <Chip
+                          active={postConfig.postFxSoloEnabled ?? false}
+                          onClick={() => {
+                            const enabled = postConfig.postFxSoloEnabled ?? false;
+                            const soloId: PostFxEffectId = postConfig.postFxSoloId ?? 'bloom';
+                            if (!enabled) {
+                              setPostConfig({ postFxSoloEnabled: true, postFxSoloId: postFxSelected });
+                              return;
+                            }
+                            if (soloId === postFxSelected) {
+                              setPostConfig({ postFxSoloEnabled: false });
+                              return;
+                            }
+                            setPostConfig({ postFxSoloId: postFxSelected });
+                          }}
+                          accent="#a78bfa"
+                        >
+                          Solo {(postConfig.postFxSoloEnabled ?? false) ? postFxLabel[postConfig.postFxSoloId ?? 'bloom'] : 'Off'}
                         </Chip>
                       </div>
 
@@ -1536,6 +1653,7 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                     { l: 'Vort', v: 4 },
                     { l: 'Dye', v: 5 },
                     { l: 'Temp', v: 6 },
+                    { l: 'Obs', v: 7 },
                   ]}
                   value={postConfig.debugView ?? 0}
                   onChange={(v) => setPostConfig({ debugView: v })}
@@ -1575,6 +1693,38 @@ export const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                   onChange={v => setFluidConfig({ mouseForce: v })} accent="#34d399" />
                 <Slider label="Mouse Radius" v={config.mouseRadius ?? 0.05} min={0.01} max={0.2} step={0.01}
                   onChange={v => setFluidConfig({ mouseRadius: v })} accent="#34d399" />
+              </div>
+            </div>
+
+            {/* Obstacles */}
+            <div className="global-group">
+              <span className="gg-title">Obstacles</span>
+              <div className="gg-row inline">
+                <Chip active={config.obstaclesEnabled ?? false} onClick={() => setFluidConfig({ obstaclesEnabled: !(config.obstaclesEnabled ?? false) })} accent="#a78bfa">
+                  Obstacles {(config.obstaclesEnabled ?? false) ? 'On' : 'Off'}
+                </Chip>
+                <Chip active={false} onClick={() => solver?.clearObstacles?.()} accent="#a78bfa">
+                  Clear
+                </Chip>
+              </div>
+              <div className="gg-row">
+                <Slider label="Threshold" v={config.obstacleThreshold ?? 0.5} min={0} max={1} step={0.01}
+                  onChange={v => setFluidConfig({ obstacleThreshold: v })} accent="#a78bfa" />
+              </div>
+              <div className="gg-row inline">
+                <span className="gg-label">Tool</span>
+                <Toggle
+                  options={[
+                    { l: 'Fluid', v: 'fluid' },
+                    { l: 'Obs+', v: 'obstaclePaint' },
+                    { l: 'Obs-', v: 'obstacleErase' },
+                    { l: 'Fuel', v: 'fuelPaint' },
+                    { l: 'Heat', v: 'heatPaint' },
+                  ]}
+                  value={mouseTool}
+                  onChange={(v) => setMouseTool(v)}
+                  accent="#a78bfa"
+                />
               </div>
             </div>
           </>

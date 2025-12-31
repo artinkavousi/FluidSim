@@ -6,4 +6,4 @@
 export * from './EmitterPanel';
 export * from './ControlSidebar';
 export * from './UnifiedPanel';
-
+export * from './MaterialPresetPanel';

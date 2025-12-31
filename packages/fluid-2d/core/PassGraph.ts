@@ -8,6 +8,8 @@
 
 import * as THREE from 'three/webgpu';
 
+export type PassGroup = 'sim' | 'post' | 'debug' | 'utility' | 'experiment';
+
 /**
  * Uniform collection for a pass
  */
@@ -37,6 +39,12 @@ export interface Pass {
     label: string;
     /** Whether this pass is currently enabled */
     enabled: boolean;
+
+    /** Optional: pass grouping for UI/budget control */
+    group?: PassGroup;
+
+    /** Optional: pass is safe to skip under budget pressure */
+    optional?: boolean;
 
     /** Input textures (read) */
     inputs: PassIO[];
@@ -68,6 +76,26 @@ export interface Pass {
      * Optional: post-execution callback (e.g., for ping-pong swapping)
      */
     afterRun?: () => void;
+
+    /**
+     * Optional: conditional execution (e.g., based on frame budget or config).
+     * Returning false will skip execution for this run.
+     */
+    shouldRun?: (ctx: PassRunContext) => boolean;
+}
+
+export interface PassRunContext {
+    renderer: THREE.WebGPURenderer;
+    config: Record<string, unknown>;
+    dt: number;
+    time: number;
+    elapsedMs: number;
+    frameBudgetMs?: number;
+}
+
+export interface PassRunOptions {
+    groups?: PassGroup[];
+    frameBudgetMs?: number;
 }
 
 /**
@@ -77,6 +105,34 @@ export interface PassTiming {
     id: string;
     label: string;
     ms: number;
+    group?: PassGroup;
+    gpuMs?: number;
+    gpuTimestampUID?: string;
+}
+
+export interface PassMetadata {
+    id: string;
+    label: string;
+    enabled: boolean;
+    group: PassGroup;
+    after?: string[];
+    inputs: Array<{ name: string; access: 'read' }>;
+    outputs: Array<{ name: string; access: 'write' }>;
+}
+
+export type PassGraphChangeType =
+    | 'register'
+    | 'registerAll'
+    | 'unregister'
+    | 'replace'
+    | 'setEnabled'
+    | 'setGroupEnabled'
+    | 'clear';
+
+export interface PassGraphChangeEvent {
+    type: PassGraphChangeType;
+    passId?: string;
+    group?: PassGroup;
 }
 
 /**
@@ -87,6 +143,8 @@ export class PassGraph {
     private order: string[] = [];
     private timings: PassTiming[] = [];
     private timingEnabled = false;
+    private gpuTimingEnabled = false;
+    private changeListeners = new Set<(event: PassGraphChangeEvent) => void>();
 
     /**
      * Register a pass with the graph
@@ -94,6 +152,22 @@ export class PassGraph {
     register(pass: Pass): void {
         this.passes.set(pass.id, pass);
         this.rebuildOrder();
+        this.emitChange({ type: 'register', passId: pass.id });
+    }
+
+    /**
+     * Replace an existing pass (hot-swap). If the pass does not exist, this registers it.
+     */
+    replace(id: string, newPass: Pass, opts?: { preserveEnabled?: boolean }): void {
+        const prev = this.passes.get(id);
+        const preserveEnabled = opts?.preserveEnabled ?? true;
+        if (prev && preserveEnabled) {
+            newPass.enabled = prev.enabled;
+        }
+
+        this.passes.set(id, { ...newPass, id });
+        this.rebuildOrder();
+        this.emitChange({ type: 'replace', passId: id });
     }
 
     /**
@@ -104,6 +178,7 @@ export class PassGraph {
             this.passes.set(pass.id, pass);
         }
         this.rebuildOrder();
+        this.emitChange({ type: 'registerAll' });
     }
 
     /**
@@ -112,6 +187,7 @@ export class PassGraph {
     unregister(id: string): void {
         this.passes.delete(id);
         this.rebuildOrder();
+        this.emitChange({ type: 'unregister', passId: id });
     }
 
     /**
@@ -135,6 +211,7 @@ export class PassGraph {
         const pass = this.passes.get(id);
         if (pass) {
             pass.enabled = enabled;
+            this.emitChange({ type: 'setEnabled', passId: id });
         }
     }
 
@@ -143,6 +220,26 @@ export class PassGraph {
      */
     setTimingEnabled(enabled: boolean): void {
         this.timingEnabled = enabled;
+    }
+
+    /**
+     * Enable/disable GPU timestamp tracking (true GPU timings require `await renderer.resolveTimestampsAsync('compute')`).
+     */
+    setGpuTimingEnabled(enabled: boolean): void {
+        this.gpuTimingEnabled = enabled;
+    }
+
+    /**
+     * Enable/disable all passes in a group.
+     */
+    setGroupEnabled(group: PassGroup, enabled: boolean): void {
+        for (const pass of this.passes.values()) {
+            const passGroup = pass.group ?? 'sim';
+            if (passGroup === group) {
+                pass.enabled = enabled;
+            }
+        }
+        this.emitChange({ type: 'setGroupEnabled', group });
     }
 
     /**
@@ -190,15 +287,46 @@ export class PassGraph {
         renderer: THREE.WebGPURenderer,
         config: Record<string, unknown>,
         dt: number,
-        time: number
+        time: number,
+        options?: PassRunOptions
     ): void {
-        if (this.timingEnabled) {
+        if (this.timingEnabled || this.gpuTimingEnabled) {
             this.timings = [];
         }
+
+        if (this.gpuTimingEnabled) {
+            const backend = (renderer as any).backend;
+            if (backend && typeof backend.trackTimestamp === 'boolean') {
+                backend.trackTimestamp = true;
+            }
+        }
+
+        const frameT0 = performance.now();
+        const groupFilter = options?.groups ? new Set(options.groups) : null;
+        const frameBudgetMs = options?.frameBudgetMs;
 
         for (const id of this.order) {
             const pass = this.passes.get(id);
             if (!pass || !pass.enabled) continue;
+
+            const group = pass.group ?? 'sim';
+            if (groupFilter && !groupFilter.has(group)) continue;
+
+            const elapsedMs = performance.now() - frameT0;
+            if (frameBudgetMs !== undefined && elapsedMs >= frameBudgetMs && pass.optional) {
+                continue;
+            }
+
+            const ctx: PassRunContext = {
+                renderer,
+                config,
+                dt,
+                time,
+                elapsedMs,
+                frameBudgetMs,
+            };
+
+            if (pass.shouldRun && pass.shouldRun(ctx) === false) continue;
 
             const t0 = this.timingEnabled ? performance.now() : 0;
 
@@ -215,11 +343,19 @@ export class PassGraph {
             // Post-execution callback
             pass.afterRun?.();
 
-            if (this.timingEnabled) {
+            if (this.timingEnabled || this.gpuTimingEnabled) {
+                const backend = (renderer as any).backend;
+                const gpuTimestampUID =
+                    this.gpuTimingEnabled && backend && !pass.execute && pass.compute
+                        ? backend.getTimestampUID(pass.compute)
+                        : undefined;
+
                 this.timings.push({
                     id,
                     label: pass.label,
-                    ms: performance.now() - t0,
+                    ms: this.timingEnabled ? performance.now() - t0 : 0,
+                    group,
+                    gpuTimestampUID,
                 });
             }
         }
@@ -233,11 +369,48 @@ export class PassGraph {
         renderer: THREE.WebGPURenderer,
         config: Record<string, unknown>,
         dt: number,
-        time: number
+        time: number,
+        options?: PassRunOptions
     ): void {
+        if (this.timingEnabled || this.gpuTimingEnabled) {
+            this.timings = [];
+        }
+
+        if (this.gpuTimingEnabled) {
+            const backend = (renderer as any).backend;
+            if (backend && typeof backend.trackTimestamp === 'boolean') {
+                backend.trackTimestamp = true;
+            }
+        }
+
+        const frameT0 = performance.now();
+        const groupFilter = options?.groups ? new Set(options.groups) : null;
+        const frameBudgetMs = options?.frameBudgetMs;
+
         for (const id of ids) {
             const pass = this.passes.get(id);
             if (!pass || !pass.enabled) continue;
+
+            const group = pass.group ?? 'sim';
+            if (groupFilter && !groupFilter.has(group)) continue;
+
+            const elapsedMs = performance.now() - frameT0;
+            if (frameBudgetMs !== undefined && elapsedMs >= frameBudgetMs && pass.optional) {
+                continue;
+            }
+
+            const ctx: PassRunContext = {
+                renderer,
+                config,
+                dt,
+                time,
+                elapsedMs,
+                frameBudgetMs,
+            };
+
+            if (pass.shouldRun && pass.shouldRun(ctx) === false) continue;
+
+            const t0 = this.timingEnabled ? performance.now() : 0;
 
             pass.prepare?.(config, dt, time);
             if (pass.execute) {
@@ -246,6 +419,44 @@ export class PassGraph {
                 renderer.compute(pass.compute);
             }
             pass.afterRun?.();
+
+            if (this.timingEnabled || this.gpuTimingEnabled) {
+                const backend = (renderer as any).backend;
+                const gpuTimestampUID =
+                    this.gpuTimingEnabled && backend && !pass.execute && pass.compute
+                        ? backend.getTimestampUID(pass.compute)
+                        : undefined;
+
+                this.timings.push({
+                    id,
+                    label: pass.label,
+                    ms: this.timingEnabled ? performance.now() - t0 : 0,
+                    group,
+                    gpuTimestampUID,
+                });
+            }
+        }
+    }
+
+    /**
+     * Resolve GPU timings for the last run (requires `renderer.backend.trackTimestamp = true`).
+     * This method is async and may stall while reading back query results.
+     */
+    async resolveGpuTimingsAsync(renderer: THREE.WebGPURenderer): Promise<void> {
+        if (!this.gpuTimingEnabled) return;
+
+        const resolve = (renderer as any).resolveTimestampsAsync as ((type?: string) => Promise<number>) | undefined;
+        const backend = (renderer as any).backend;
+        if (!resolve || !backend) return;
+
+        await resolve('compute');
+
+        for (const timing of this.timings) {
+            const uid = timing.gpuTimestampUID;
+            if (!uid) continue;
+            if (backend.hasTimestamp?.(uid)) {
+                timing.gpuMs = backend.getTimestamp(uid);
+            }
         }
     }
 
@@ -278,6 +489,21 @@ export class PassGraph {
     }
 
     /**
+     * Get all passes as serializable metadata (for UI / node editor).
+     */
+    getPassMetadata(): PassMetadata[] {
+        return Array.from(this.passes.values()).map((p) => ({
+            id: p.id,
+            label: p.label,
+            enabled: p.enabled,
+            group: p.group ?? 'sim',
+            after: p.after ? [...p.after] : undefined,
+            inputs: p.inputs.map((io) => ({ name: io.name, access: 'read' as const })),
+            outputs: p.outputs.map((io) => ({ name: io.name, access: 'write' as const })),
+        }));
+    }
+
+    /**
      * Get all enabled pass IDs
      */
     getEnabledPassIds(): string[] {
@@ -293,5 +519,24 @@ export class PassGraph {
         this.passes.clear();
         this.order = [];
         this.timings = [];
+        this.emitChange({ type: 'clear' });
+    }
+
+    /**
+     * Subscribe to graph changes (for UI / visual editor).
+     */
+    subscribe(listener: (event: PassGraphChangeEvent) => void): () => void {
+        this.changeListeners.add(listener);
+        return () => this.changeListeners.delete(listener);
+    }
+
+    private emitChange(event: PassGraphChangeEvent): void {
+        for (const listener of this.changeListeners) {
+            try {
+                listener(event);
+            } catch (e) {
+                console.warn('[PassGraph] change listener error', e);
+            }
+        }
     }
 }

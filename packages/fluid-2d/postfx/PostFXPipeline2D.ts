@@ -47,6 +47,8 @@ export type PostFXPipeline2DResources = {
   lutTexture3D: THREE.Texture | null;
   lutSize: number;
   velocityTexture: THREE.Texture | null;
+  width: number;
+  height: number;
 };
 
 export class PostFXPipeline2D {
@@ -85,6 +87,7 @@ export class PostFXPipeline2D {
   private resolution = uniform(new THREE.Vector2(1920, 1080));
 
   private motionBlurSamples = uniform(8);
+  private motionBlurStrength = uniform(0.0);
   private velocityTexture: THREE.Texture | null = null;
 
   private flags: PostFXActiveFlags | null = null;
@@ -113,7 +116,7 @@ export class PostFXPipeline2D {
       grain: (postConfig.noiseIntensity ?? 0) > 1e-6,
       afterImage: postConfig.afterImageEnabled ?? false,
       trails: postConfig.trailEnabled ?? false,
-      motionBlur: postConfig.motionBlurEnabled ?? false,
+      motionBlur: (postConfig.motionBlurEnabled ?? false) && (postConfig.motionBlurStrength ?? 0) > 1e-6,
       fxaa: postConfig.fxaaEnabled ?? false,
     };
   }
@@ -246,8 +249,7 @@ export class PostFXPipeline2D {
           this.velocityNode = velNode;
 
           const vel = velNode.xy;
-          // Scale velocity from sim units to UV offset (tune this)
-          const v = vel.mul(float(0.02));
+          const v = vel.mul(this.motionBlurStrength);
 
           const count = int(this.motionBlurSamples);
           const result = vec3(0).toVar();
@@ -288,10 +290,38 @@ export class PostFXPipeline2D {
   update(postConfig: RenderOutput2DConfig, resources: PostFXPipeline2DResources): { outputNode: any; rebuilt: boolean } {
     this.velocityTexture = resources.velocityTexture;
     this.motionBlurSamples.value = postConfig.motionBlurSamples ?? 8;
+    this.motionBlurStrength.value = postConfig.motionBlurStrength ?? 0.0;
 
-    const flags = this.computeFlags(postConfig);
-    const order = sanitizePostFxOrder(postConfig.postFxOrder);
-    const orderKey = order.join('|');
+    const scale = Math.max(0.25, Math.min(1.0, postConfig.postResolutionScale ?? 1.0));
+    const w = Math.max(1, Math.floor((resources.width ?? 1) * scale));
+    const h = Math.max(1, Math.floor((resources.height ?? 1) * scale));
+    this.resolution.value.set(w, h);
+
+    const baseFlags = this.computeFlags(postConfig);
+    const soloEnabled = (postConfig.postFxSoloEnabled ?? false) && !(postConfig.postFxBypass ?? false);
+    const soloId = (postConfig.postFxSoloId as any) ?? 'bloom';
+
+    const flags: PostFXActiveFlags = soloEnabled
+      ? {
+        ...baseFlags,
+        bloom: soloId === 'bloom' ? baseFlags.bloom : false,
+        chromatic: soloId === 'chromatic' ? baseFlags.chromatic : false,
+        rgbShift: soloId === 'rgbShift' ? baseFlags.rgbShift : false,
+        clarity: soloId === 'clarity' ? baseFlags.clarity : false,
+        sharpen: soloId === 'sharpen' ? baseFlags.sharpen : false,
+        grain: soloId === 'grain' ? baseFlags.grain : false,
+        afterImage: soloId === 'afterImage' ? baseFlags.afterImage : false,
+        trails: soloId === 'trails' ? baseFlags.trails : false,
+        motionBlur: soloId === 'motionBlur' ? baseFlags.motionBlur : false,
+      }
+      : baseFlags;
+
+    const rawOrder = sanitizePostFxOrder(postConfig.postFxOrder);
+    const order = soloEnabled
+      ? (['grading', 'vignette', soloId] as PostFxEffectId[]).filter((v, i, a) => a.indexOf(v) === i)
+      : rawOrder;
+
+    const orderKey = `${soloEnabled ? `solo:${soloId}` : 'full'}|${order.join('|')}`;
 
     const shouldRebuild =
       this.flags == null ||
@@ -368,4 +398,3 @@ export class PostFXPipeline2D {
     this.disposeOptionalNodes();
   }
 }
-

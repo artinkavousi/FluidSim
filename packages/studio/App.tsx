@@ -9,10 +9,11 @@ import { FluidCanvas2D } from '../fluid-2d/components/FluidCanvas2D';
 import { FluidProvider2D, useFluid2D } from '../fluid-2d/components/FluidProvider2D';
 import { createEmitterManager } from '../fluid-2d/emitters/EmitterManager';
 import { UnifiedPanel } from './panels/UnifiedPanel';
-import { useStudioStore } from './store';
+import { useStudioStore, useMaterialPresetStore } from './store'; // Check checking export
 import { colors, effects, radius, spacing } from './ui/theme';
 import type { Emitter } from '../fluid-2d/emitters/types';
 import type { PerfStats2D } from '../fluid-2d/FluidSolver2D';
+import { PerformanceHUD, performanceHUDStyles } from './components/PerformanceHUD';
 
 // ============================================
 // Minimal Toolbar
@@ -26,7 +27,7 @@ const Toolbar: React.FC<{
   const setIsPlaying = useStudioStore((s) => s.setIsPlaying);
 
   return (
-    <motion.div 
+    <motion.div
       className="toolbar"
       initial={{ opacity: 0, y: -12 }}
       animate={{ opacity: 1, y: 0 }}
@@ -121,6 +122,7 @@ const Toolbar: React.FC<{
 
 const StudioContent: React.FC = () => {
   const {
+    solver,
     emitters,
     addEmitter: baseAddEmitter,
     removeEmitter: baseRemoveEmitter,
@@ -141,8 +143,21 @@ const StudioContent: React.FC = () => {
     pause,
   } = useFluid2D();
 
+  // Material Store
+  const matEnabled = useMaterialPresetStore(s => s.enabled);
+  const matActiveId = useMaterialPresetStore(s => s.activePresetId);
+  const matParams = useMaterialPresetStore(s => s.params);
+  const materialGraphPreset = matEnabled ? matActiveId : null;
+
   const [showPanel, setShowPanel] = useState(true);
-  
+  const [passTimings, setPassTimings] = useState<Array<{ id: string; ms: number; label?: string }>>([]);
+  const [memoryStats, setMemoryStats] = useState<{ fieldCount: number; totalBytes: number; byField: Map<string, number> } | null>(null);
+
+  const solverRef = useRef<typeof solver>(solver);
+  useEffect(() => {
+    solverRef.current = solver;
+  }, [solver]);
+
   // History-wrapped emitter operations
   const historyManager = useStudioStore((s) => s.historyManager);
   const refreshHistoryState = useStudioStore((s) => s.refreshHistoryState);
@@ -187,7 +202,7 @@ const StudioContent: React.FC = () => {
       },
     });
   }, [historyManager, emitterManager, setStoreConfig, setStorePostConfig]);
-  
+
   const addEmitter = useCallback((emitterConfig: Omit<Emitter, 'id'>) => {
     const id = baseAddEmitter(emitterConfig);
     const emitter = emitterManager.getEmitter(id);
@@ -236,6 +251,7 @@ const StudioContent: React.FC = () => {
   const storeGizmosEnabled = useStudioStore((s) => s.gizmosEnabled);
   const storeMouseEnabled = useStudioStore((s) => s.mouseEnabled);
   const storeMouseHoverMode = useStudioStore((s) => s.mouseHoverMode);
+  const storeMouseTool = useStudioStore((s) => s.mouseTool);
   const audioLevels = useStudioStore((s) => s.audio.levels);
 
   const autoQualityRef = useRef({
@@ -335,15 +351,37 @@ const StudioContent: React.FC = () => {
       state.setFps(runtimeRef.current.fpsEma);
 
       const perfOn = cfg.perfEnabled ?? false;
-      if (perfOn) state.setPerf(perf ?? null);
-      else if (state.perf) state.setPerf(null);
+      if (perfOn) {
+        state.setPerf(perf ?? null);
+
+        const s = solverRef.current;
+        if (s) {
+          const timings = s.getPassTimings?.() ?? [];
+          setPassTimings(timings.map((t) => ({ id: t.id, ms: t.gpuMs ?? t.ms, label: t.label })));
+
+          const mem = s.getFieldMemoryStats?.();
+          const bytes = mem?.allocatedBytes ?? 0;
+          setMemoryStats({ fieldCount: s.getFieldCount?.() ?? 0, totalBytes: bytes, byField: new Map() });
+        } else {
+          setPassTimings([]);
+          setMemoryStats(null);
+        }
+      } else {
+        if (state.perf) state.setPerf(null);
+        setPassTimings([]);
+        setMemoryStats(null);
+      }
 
       runtimeRef.current.lastUiMs = now;
     } else {
       // Clear promptly if user disables perf.
-      if (!(cfg.perfEnabled ?? false) && state.perf) state.setPerf(null);
+      if (!(cfg.perfEnabled ?? false)) {
+        if (state.perf) state.setPerf(null);
+        if (passTimings.length) setPassTimings([]);
+        if (memoryStats) setMemoryStats(null);
+      }
     }
-  }, []);
+  }, [memoryStats, passTimings.length]);
   useEffect(() => { setConfig(storeConfig); }, [storeConfig, setConfig]);
   useEffect(() => { setStoreSelection(selection); }, [selection, setStoreSelection]);
   useEffect(() => {
@@ -359,6 +397,8 @@ const StudioContent: React.FC = () => {
   const redo = useStudioStore((s) => s.redo);
   const canUndo = useStudioStore((s) => s.canUndo);
   const canRedo = useStudioStore((s) => s.canRedo);
+  const uiFps = useStudioStore((s) => s.fps);
+  const uiPerf = useStudioStore((s) => s.perf);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -427,13 +467,25 @@ const StudioContent: React.FC = () => {
           postConfig={storePostConfig}
           mouseEnabled={mouseEnabled}
           mouseHoverMode={storeMouseHoverMode}
+          mouseTool={storeMouseTool}
           emitterManager={emitterManager}
           selection={selection}
           gizmosEnabled={gizmosEnabled}
           audioData={audioLevels || undefined}
           onFrame={handleFrame}
+          materialGraphPreset={materialGraphPreset}
+          materialParams={matParams}
         />
       </div>
+
+      <PerformanceHUD
+        fps={uiFps}
+        frameTime={uiPerf?.frameMs ?? 0}
+        passTimings={passTimings}
+        memoryStats={memoryStats ?? undefined}
+        visible={storeConfig.perfEnabled ?? false}
+        position="top-left"
+      />
 
       <AnimatePresence>
         {showPanel && (
@@ -484,6 +536,7 @@ const StudioContent: React.FC = () => {
           z-index: 50;
         }
       `}</style>
+      <style>{performanceHUDStyles}</style>
     </div>
   );
 };

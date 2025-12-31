@@ -13,6 +13,11 @@ export interface RenderOutput2DConfig {
   postBackend: number;
   // quick A/B for post stack (applies to both backends)
   postFxBypass: boolean;
+  // WebGPU PostProcessing: solo a single effect (still applies core grading/vignette)
+  postFxSoloEnabled: boolean;
+  postFxSoloId: PostFxEffectId;
+  // WebGPU PostProcessing: internal resolution scale (0.25..1.0)
+  postResolutionScale: number;
   fxaaEnabled: boolean;
 
   // Tonemapping/exposure (post chain)
@@ -134,7 +139,7 @@ export interface RenderOutput2DConfig {
   rgbShiftAngle: number;
 
   // Debug visualization (render-time only)
-  debugView: number; // 0 off, 1 velocity, 2 pressure, 3 divergence, 4 vorticity, 5 dye raw
+  debugView: number; // 0 off, 1 velocity, 2 pressure, 3 divergence, 4 vorticity, 5 dye raw, 6 temperature, 7 obstacles
   debugScale: number; // scales scalar/velocity for visibility
   debugBias: number; // adds to scalar before mapping
 
@@ -190,6 +195,9 @@ export const defaultPostConfig: RenderOutput2DConfig = {
   postEnabled: false,
   postBackend: 0,
   postFxBypass: false,
+  postFxSoloEnabled: false,
+  postFxSoloId: 'bloom',
+  postResolutionScale: 1.0,
   fxaaEnabled: false,
 
   exposure: 1.0,

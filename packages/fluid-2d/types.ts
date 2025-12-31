@@ -61,6 +61,10 @@ export interface Splat {
   /** Optional temperature value to inject at this splat (0..10 typical range) */
   temperature?: number;
 
+  // Fuel field (for combustion/reaction system)
+  /** Optional fuel value to inject at this splat (0..10 typical range) */
+  fuel?: number;
+
   // Obstacle field (for painting obstacles)
   /** Optional obstacle value to paint (0-1, where 1=solid obstacle) */
   obstacle?: number;

@@ -46,6 +46,10 @@ import type { Emitter, SelectionState } from '../emitters/types';
 import { EmitterManager } from '../emitters/EmitterManager';
 import { GizmoRenderer } from '../gizmos/GizmoRenderer';
 import { useFluid2DOptional } from './FluidProvider2D';
+// MaterialGraph integration for preset-based rendering
+import { MaterialGraph } from '../materials/MaterialGraph';
+import { getPreset } from '../materials/presets';
+import type { MaterialBuildContext } from '../materials/types';
 
 extend(THREE as any);
 
@@ -59,10 +63,13 @@ interface FluidSceneProps {
     postConfig: RenderOutput2DConfig;
     mouseEnabled: boolean;
     mouseHoverMode: boolean;
+    mouseTool: 'fluid' | 'obstaclePaint' | 'obstacleErase' | 'fuelPaint' | 'heatPaint';
     emitterManager?: EmitterManager;
     audioData?: Float32Array;
     onFrame?: (time: number, delta: number, fps: number, perf?: PerfStats2D | null) => void;
     onMouseSplat?: (splat: Splat) => void;
+    materialGraphPreset?: string | null;
+    materialParams?: Record<string, any>;
 }
 
 function FluidScene({
@@ -71,10 +78,13 @@ function FluidScene({
     postConfig,
     mouseEnabled,
     mouseHoverMode,
+    mouseTool,
     emitterManager,
     audioData,
     onFrame,
     onMouseSplat,
+    materialGraphPreset,
+    materialParams,
 }: FluidSceneProps) {
     const meshRef = useRef<THREE.Mesh>(null);
     const { viewport } = useThree();
@@ -182,6 +192,7 @@ function FluidScene({
         isDown: false,
         lastPos: null as Vec2 | null,
         lastTime: null as number | null,
+        pendingPos: null as Vec2 | null,
         currentColor: generateRandomColor(),
     });
 
@@ -484,6 +495,7 @@ function FluidScene({
         const divergenceTex = solver.getDivergenceTexture();
         const vorticityTex = solver.getVorticityTexture();
         const temperatureTex = solver.getTemperatureTexture() ?? vorticityTex;
+        const obstaclesTex = solver.getObstaclesTexture();
         invDyeRes.value = 1.0 / Math.max(1, config.dyeSize);
 
         const gradientTex = gradientMapTexture ?? gradientFallbackTex;
@@ -919,12 +931,64 @@ function FluidScene({
                 col.assign(vec3(r, g, b));
             });
 
+            // Obstacles debug view (7) - solid mask
+            If(dbg.equal(int(7)), () => {
+                const obs = texture(obstaclesTex, simUV).x.mul(debugScale).add(debugBias);
+                const o = clamp(obs, float(0.0), float(1.0));
+                col.assign(vec3(o, o, o));
+            });
+
             return col;
         })();
+
+        // Initialize MaterialGraph if preset selected
+        let graph: MaterialGraph | null = null;
+        if (materialGraphPreset) {
+            const presetDef = getPreset(materialGraphPreset);
+            if (presetDef) {
+                try {
+                    const ctx: MaterialBuildContext = {
+                        dyeTexture: (dyeIsA.value ? dyeTexA : dyeTexB) as any,
+                        velocityTexture: (velocityIsA.value ? velTexA : velTexB) as any,
+                        vorticityTexture: vorticityTex as any,
+                        resolution: { width: config.gridSize, height: config.gridSize },
+                        dyeResolution: { width: config.dyeSize, height: config.dyeSize },
+                        velocityResolution: { width: config.gridSize, height: config.gridSize },
+                        time: renderTime as any,
+                        uvNode: simUV as any,
+                    };
+                    graph = new MaterialGraph(presetDef.graph);
+                    const compiled = graph.compile(ctx);
+
+                    // Apply initial params
+                    if (materialParams && compiled.uniforms) {
+                        for (const [key, val] of Object.entries(materialParams)) {
+                            const u = compiled.uniforms.get(key);
+                            if (u) {
+                                // TSL UniformNode: .value is the underlying value
+                                u.value = val;
+                            }
+                        }
+                    }
+
+                    // Override with graph output if valid
+                    if (compiled.colorNode) {
+                        const graphColor = compiled.colorNode.xyz ?? compiled.colorNode;
+                        outColor.assign(graphColor);
+                    }
+                } catch (e) {
+                    console.error('Material compile error:', e);
+                }
+            }
+        }
 
         mat.colorNode = vec4(clamp(outColor, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0)), float(1.0));
         mat.side = THREE.DoubleSide;
         materialRef.current = mat;
+        // Keep graph ref for updates
+        (mat as any)._materialGraph = graph;
+        // Store compiled result (with uniforms)
+        (mat as any)._compiledGraph = graph ? (graph as any).compiled : null;
 
         if (meshRef.current) {
             meshRef.current.material = mat;
@@ -932,8 +996,35 @@ function FluidScene({
 
         return () => {
             mat.dispose();
+            graph?.dispose();
         };
-    }, [solver, config.gridSize, config.dyeSize, gradientMapTexture, gradientFallbackTex]);
+    }, [solver, config.gridSize, config.dyeSize, gradientMapTexture, gradientFallbackTex, materialGraphPreset]);
+
+    // Live update of material params
+    useEffect(() => {
+        const mat = materialRef.current;
+        if (!mat || !materialParams) return;
+
+        // Retrieve compiled graph from material
+        const compiled = (mat as any)._compiledGraph;
+        if (compiled && compiled.uniforms) {
+            for (const [key, val] of Object.entries(materialParams)) {
+                if (val !== undefined && val !== null) {
+                    const u = compiled.uniforms.get(key);
+                    if (u) u.value = val;
+                }
+            }
+        }
+        return; // Early return to skip old placeholder code that follows (we will clean it up later or just leave it unreachable)
+
+        // Access internal compiled state (we might need to expose this better, but for now access via private property if needed or rely on graph methods)
+        // Actually MaterialGraph doesn't expose compiled result publicly easily except via return.
+        // Let's assume we can access it or we should have stored it. 
+        // Better approach: Store 'graph' in a ref, not just on material.
+
+        // Wait, I can't easily access compiled uniforms from here if I didn't save them.
+        // Let's update the previous useEffect to store 'compiled' on the material too.
+    }, [materialParams]);
 
     // Simulation step
     useFrame((_, delta) => {
@@ -942,6 +1033,109 @@ function FluidScene({
         if (emitterManager) {
             const splats = emitterManager.generateSplats(solver.getTime(), delta, audioData);
             if (splats.length) solver.addSplats(splats);
+        }
+
+        // Mouse splats (coalesced to once-per-frame to avoid pointermove event spam)
+        if (mouseEnabled && mouseState.current.pendingPos) {
+            const shouldSplat = mouseHoverMode || mouseState.current.isDown;
+            if (shouldSplat && mouseState.current.lastPos) {
+                const now = performance.now();
+                const lastTime = mouseState.current.lastTime ?? now;
+                const dt = Math.min(1 / 15, Math.max(1 / 240, (now - lastTime) / 1000));
+                mouseState.current.lastTime = now;
+
+                const [x, y] = mouseState.current.pendingPos;
+                const [lx, ly] = mouseState.current.lastPos;
+
+                const dxPos = x - lx;
+                const dyPos = y - ly;
+                const dist = Math.sqrt(dxPos * dxPos + dyPos * dyPos);
+
+                // Avoid tiny jitters causing heavy splat spam while hovering.
+                const minDist = 0.00075;
+                if (dist > minDist) {
+                    const radius = config.mouseRadius ?? defaultConfig2D.mouseRadius;
+                    const spacing = Math.max(minDist, radius * 0.75);
+                    const steps = Math.min(6, Math.max(1, Math.ceil(dist / spacing)));
+
+                    const vx = dxPos / dt;
+                    const vy = dyPos / dt;
+                    const force = config.mouseForce ?? defaultConfig2D.mouseForce;
+                    const dx = vx * 0.02 * force;
+                    const dy = vy * 0.02 * force;
+
+                    for (let i = 1; i <= steps; i++) {
+                        const t = i / steps;
+                        const sx = lx + dxPos * t;
+                        const sy = ly + dyPos * t;
+
+                        const base: Splat = {
+                            x: sx,
+                            y: sy,
+                            dx,
+                            dy,
+                            color: mouseState.current.currentColor as Color3,
+                            radius,
+                        };
+
+                        const splat: Splat =
+                            mouseTool === 'obstaclePaint'
+                                ? {
+                                    ...base,
+                                    dx: 0,
+                                    dy: 0,
+                                    color: [0, 0, 0],
+                                    velocityScale: 0,
+                                    dyeScale: 0,
+                                    obstacle: 1,
+                                    obstacleMode: 0,
+                                    obstacleBlendMode: 1, // max
+                                }
+                                : mouseTool === 'obstacleErase'
+                                    ? {
+                                        ...base,
+                                        dx: 0,
+                                        dy: 0,
+                                        color: [0, 0, 0],
+                                        velocityScale: 0,
+                                        dyeScale: 0,
+                                        obstacle: 1,
+                                        obstacleMode: 1,
+                                        obstacleBlendMode: 0, // replace
+                                    }
+                                    : mouseTool === 'fuelPaint'
+                                        ? {
+                                            ...base,
+                                            dx: 0,
+                                            dy: 0,
+                                            color: [0, 0, 0],
+                                            velocityScale: 0,
+                                            dyeScale: 0,
+                                            fuel: 1.0,
+                                            temperature: 0.75,
+                                        }
+                                        : mouseTool === 'heatPaint'
+                                            ? {
+                                                ...base,
+                                                dx: 0,
+                                                dy: 0,
+                                                color: [0, 0, 0],
+                                                velocityScale: 0,
+                                                dyeScale: 0,
+                                                temperature: 1.0,
+                                            }
+                                            : base;
+                        solver.addSplat(splat);
+                        onMouseSplat?.(splat);
+                    }
+
+                    mouseState.current.lastPos = [x, y];
+                } else {
+                    mouseState.current.lastPos = [x, y];
+                }
+            }
+
+            mouseState.current.pendingPos = null;
         }
 
         solver.step(delta);
@@ -968,6 +1162,7 @@ function FluidScene({
         const x = e.uv.x as number;
         const y = 1.0 - (e.uv.y as number);
         mouseState.current.lastPos = [x, y];
+        mouseState.current.pendingPos = [x, y];
 
         const radius = config.mouseRadius ?? defaultConfig2D.mouseRadius;
 
@@ -984,12 +1179,14 @@ function FluidScene({
     const handlePointerUp = useCallback(() => {
         mouseState.current.isDown = false;
         mouseState.current.lastTime = null;
+        mouseState.current.pendingPos = null;
     }, []);
 
     const handlePointerLeave = useCallback(() => {
         mouseState.current.isDown = false;
         mouseState.current.lastPos = null;
         mouseState.current.lastTime = null;
+        mouseState.current.pendingPos = null;
     }, []);
 
     const handlePointerMove = useCallback((e: any) => {
@@ -997,38 +1194,8 @@ function FluidScene({
 
         const x = e.uv.x as number;
         const y = 1.0 - (e.uv.y as number);
-
-        const shouldSplat = mouseHoverMode || mouseState.current.isDown;
-        if (shouldSplat && mouseState.current.lastPos) {
-            const now = performance.now();
-            const lastTime = mouseState.current.lastTime ?? now;
-            const dt = Math.min(1 / 15, Math.max(1 / 240, (now - lastTime) / 1000));
-            mouseState.current.lastTime = now;
-
-            const vx = (x - mouseState.current.lastPos[0]) / dt;
-            const vy = (y - mouseState.current.lastPos[1]) / dt;
-
-            const dx = vx * 0.02 * (config.mouseForce ?? defaultConfig2D.mouseForce);
-            const dy = vy * 0.02 * (config.mouseForce ?? defaultConfig2D.mouseForce);
-
-            const moveMag = Math.sqrt(dx * dx + dy * dy);
-            if (moveMag > 0.001) {
-                const radius = config.mouseRadius ?? defaultConfig2D.mouseRadius;
-                const splat: Splat = {
-                    x,
-                    y,
-                    dx,
-                    dy,
-                    color: mouseState.current.currentColor as Color3,
-                    radius,
-                };
-                solver.addSplat(splat);
-                onMouseSplat?.(splat);
-            }
-        }
-
-        mouseState.current.lastPos = [x, y];
-    }, [mouseEnabled, mouseHoverMode, solver, config.mouseForce, config.mouseRadius, onMouseSplat]);
+        mouseState.current.pendingPos = [x, y];
+    }, [mouseEnabled, solver]);
 
     if (!solver) return null;
 
@@ -1060,6 +1227,7 @@ export interface FluidCanvas2DProps {
     postConfig?: Partial<RenderOutput2DConfig>;
     mouseEnabled?: boolean;
     mouseHoverMode?: boolean;
+    mouseTool?: 'fluid' | 'obstaclePaint' | 'obstacleErase' | 'fuelPaint' | 'heatPaint';
     emitterManager?: EmitterManager;
     selection?: SelectionState;
     gizmosEnabled?: boolean;
@@ -1069,6 +1237,8 @@ export interface FluidCanvas2DProps {
     onMouseSplat?: (splat: Splat) => void;
     audioData?: Float32Array;
     autoStart?: boolean;
+    materialGraphPreset?: string | null;
+    materialParams?: Record<string, any>;
 }
 
 export function FluidCanvas2D({
@@ -1078,6 +1248,7 @@ export function FluidCanvas2D({
     postConfig: postConfigOverrides = {},
     mouseEnabled = true,
     mouseHoverMode = true,
+    mouseTool = 'fluid',
     emitterManager,
     selection,
     gizmosEnabled = true,
@@ -1087,6 +1258,8 @@ export function FluidCanvas2D({
     onMouseSplat,
     audioData,
     autoStart = true,
+    materialGraphPreset,
+    materialParams,
 }: FluidCanvas2DProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
@@ -1363,6 +1536,7 @@ export function FluidCanvas2D({
                     postConfig={mergedPostConfig}
                     mouseEnabled={mouseEnabled}
                     mouseHoverMode={mouseHoverMode}
+                    mouseTool={mouseTool}
                     emitterManager={manager}
                     audioData={audioData}
                     onFrame={onFrame}

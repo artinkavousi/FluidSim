@@ -1,0 +1,307 @@
+import React, { useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { emitterTypeColors } from '../../ui';
+import type {
+  Emitter,
+  EmitterType,
+  DirectionMode,
+  LineEmitter,
+  CircleEmitter,
+  CurveEmitter,
+  TextEmitter,
+  SVGEmitter,
+  BrushEmitter,
+} from '../../../fluid-2d/emitters/types';
+import { getPresetNames, getPreset } from '../../../fluid-2d/emitters/presets';
+import { Chip, Color, Num, Select, Slider, Toggle } from './controls';
+
+// ============================================
+// Emitter Card - Full Inline Properties
+// ============================================
+
+export const EmitterCard: React.FC<{
+  em: Emitter;
+  expanded: boolean;
+  onToggleExpand: () => void;
+  onUpdate: (u: Partial<Emitter>) => void;
+  onRemove: () => void;
+  onDuplicate: () => void;
+}> = ({ em, expanded, onToggleExpand, onUpdate, onRemove, onDuplicate }) => {
+  const tc = emitterTypeColors[em.type];
+  const icons: Record<EmitterType, string> = {
+    point: '?', line: '?', circle: '?', curve: '?', text: 'A', svg: '?', brush: '?'
+  };
+
+  const dirModes: { l: string; v: DirectionMode }[] = [
+    { l: 'Fixed', v: 'fixed' }, { l: 'Normal', v: 'normal' }, { l: 'Tangent', v: 'tangent' },
+    { l: 'Out', v: 'outward' }, { l: 'In', v: 'inward' }, { l: 'Rand', v: 'random' }
+  ];
+
+  const updateSplatOverrides = (updates: Record<string, number | undefined>): void => {
+    const current = em.splatOverrides ?? {};
+    const next: Record<string, number | undefined> = { ...(current as Record<string, number | undefined>), ...updates };
+    Object.keys(next).forEach((k) => {
+      if (next[k] === undefined) delete next[k];
+    });
+    onUpdate({ splatOverrides: Object.keys(next).length ? (next as any) : undefined });
+  };
+
+  return (
+    <div className={`emitter-card ${expanded ? 'expanded' : ''}`}
+      style={{ '--ec': tc?.primary || '#00e5cc' } as React.CSSProperties}>
+
+      {/* Header - Always Visible */}
+      <div className="ec-header" onClick={onToggleExpand}>
+        <span className="ec-icon">{icons[em.type]}</span>
+        <Color c={em.color} onChange={c => onUpdate({ color: c })} />
+        <input className="ec-name" value={em.name} onClick={e => e.stopPropagation()}
+          onChange={e => onUpdate({ name: e.target.value })} />
+        <div className="ec-actions">
+          <Chip active={em.active} onClick={() => onUpdate({ active: !em.active })} accent={tc?.primary}>
+            {em.active ? '?' : '	'}
+          </Chip>
+          <button className="ec-btn" onClick={e => { e.stopPropagation(); onDuplicate(); }} title="Duplicate">?</button>
+          <button className="ec-btn danger" onClick={e => { e.stopPropagation(); onRemove(); }} title="Delete">x</button>
+        </div>
+        <span className={`ec-expand ${expanded ? 'open' : ''}`}>?</span>
+      </div>
+
+      {/* Properties - Expanded */}
+      <AnimatePresence>
+        {expanded && (
+          <motion.div className="ec-body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}>
+
+            {/* Row 1: Transform */}
+            <div className="ec-row r4">
+              <Slider label="X" v={em.position[0]} min={0} max={1} step={0.001}
+                onChange={v => onUpdate({ position: [v, em.position[1]] })} accent={tc?.primary} />
+              <Slider label="Y" v={em.position[1]} min={0} max={1} step={0.001}
+                onChange={v => onUpdate({ position: [em.position[0], v] })} accent={tc?.primary} />
+              <Slider label="Rot" v={em.rotation || 0} min={0} max={360} step={1} unit="ų"
+                onChange={v => onUpdate({ rotation: v })} accent={tc?.primary} />
+              <Num label="Scale" v={em.scale?.[0] || 1} step={0.1}
+                onChange={v => onUpdate({ scale: [v, v] })} />
+            </div>
+
+            {/* Row 2: Emission */}
+            <div className="ec-row r4">
+              <Slider label="Force" v={em.force} min={0} max={10} step={0.05}
+                onChange={v => onUpdate({ force: v })} accent="#ff6b6b" />
+              <Slider label="Rate" v={em.emissionRate} min={0} max={200} step={1}
+                onChange={v => onUpdate({ emissionRate: v })} accent="#ff6b6b" />
+              <Slider label="Radius" v={em.radius} min={0.001} max={0.2} step={0.001}
+                onChange={v => onUpdate({ radius: v })} accent="#ff6b6b" />
+              <Slider label="Temp" v={em.temperature ?? 0} min={0} max={10} step={0.1}
+                onChange={v => onUpdate({ temperature: v })} accent="#f97316" />
+            </div>
+
+            {/* Row 3: Modulators */}
+            <div className="ec-row r3">
+              <Slider label="F Scale" v={em.forceScale} min={0.1} max={3} step={0.05}
+                onChange={v => onUpdate({ forceScale: v })} accent="#ff6b6b" />
+              <Slider label="R Scale" v={em.radiusScale} min={0.1} max={3} step={0.05}
+                onChange={v => onUpdate({ radiusScale: v })} accent="#ff6b6b" />
+              <Slider label="Opacity" v={em.opacity} min={0} max={1} step={0.01}
+                onChange={v => onUpdate({ opacity: v })} accent="#ff6b6b" />
+            </div>
+
+            {/* Row 4: Direction & Spread */}
+            <div className="ec-row inline">
+              <span className="ec-label">Direction</span>
+              <Toggle options={dirModes} value={em.directionMode || 'fixed'}
+                onChange={v => onUpdate({ directionMode: v })} accent="#a78bfa" />
+              <Num label="Spread" v={em.spread} step={1}
+                onChange={v => onUpdate({ spread: v })} />
+            </div>
+
+            {/* Row 5: Splat Overrides */}
+            <div className="ec-row inline">
+              <span className="ec-label">Splat</span>
+              <Toggle options={[{ l: 'S', v: 0 }, { l: 'M', v: 1 }, { l: 'H', v: 2 }, { l: 'U', v: 3 }]}
+                value={em.splatOverrides?.splatFalloff ?? -1}
+                onChange={v => updateSplatOverrides({ splatFalloff: v < 0 ? undefined : v })}
+                accent="#fbbf24" />
+              <Toggle options={[{ l: 'Add', v: 0 }, { l: 'Max', v: 1 }, { l: 'Mix', v: 2 }]}
+                value={em.splatOverrides?.blendMode ?? -1}
+                onChange={v => updateSplatOverrides({ blendMode: v < 0 ? undefined : v })}
+                accent="#fbbf24" />
+              <Slider label="Dye" v={em.splatOverrides?.dyeIntensity ?? -1} min={-1} max={20} step={0.5}
+                onChange={v => updateSplatOverrides({ dyeIntensity: v < 0 ? undefined : v })} accent="#fbbf24" />
+            </div>
+
+            {/* Type-Specific Properties */}
+            {em.type === 'line' && <LineProps em={em as LineEmitter} onU={onUpdate} />}
+            {em.type === 'circle' && <CircleProps em={em as CircleEmitter} onU={onUpdate} />}
+            {em.type === 'curve' && <CurveProps em={em as CurveEmitter} onU={onUpdate} />}
+            {em.type === 'text' && <TextProps em={em as TextEmitter} onU={onUpdate} />}
+            {em.type === 'svg' && <SVGProps em={em as SVGEmitter} onU={onUpdate} />}
+            {em.type === 'brush' && <BrushProps em={em as BrushEmitter} onU={onUpdate} />}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+// ============================================
+// Type-Specific Inline Properties
+// ============================================
+
+const LineProps: React.FC<{ em: LineEmitter; onU: (u: Partial<LineEmitter>) => void }> = ({ em, onU }) => (
+  <div className="ec-type">
+    <div className="ec-row r5">
+      <Slider label="Segs" v={em.segments} min={1} max={64} step={1} onChange={v => onU({ segments: v })} accent="#60a5fa" />
+      <Num label="X1" v={em.start[0]} step={0.01} onChange={v => onU({ start: [v, em.start[1]] })} />
+      <Num label="Y1" v={em.start[1]} step={0.01} onChange={v => onU({ start: [em.start[0], v] })} />
+      <Num label="X2" v={em.end[0]} step={0.01} onChange={v => onU({ end: [v, em.end[1]] })} />
+      <Num label="Y2" v={em.end[1]} step={0.01} onChange={v => onU({ end: [em.end[0], v] })} />
+    </div>
+  </div>
+);
+
+const CircleProps: React.FC<{ em: CircleEmitter; onU: (u: Partial<CircleEmitter>) => void }> = ({ em, onU }) => (
+  <div className="ec-type">
+    <div className="ec-row r4">
+      <Slider label="Outer" v={em.outerRadius} min={0.01} max={0.5} step={0.01} onChange={v => onU({ outerRadius: v })} accent="#a78bfa" />
+      <Slider label="Inner" v={em.innerRadius} min={0} max={0.5} step={0.01} onChange={v => onU({ innerRadius: v })} accent="#a78bfa" />
+      <Slider label="Points" v={em.points} min={3} max={128} step={1} onChange={v => onU({ points: v })} accent="#a78bfa" />
+      <Toggle options={[{ l: 'Out', v: false }, { l: 'In', v: true }]}
+        value={em.inward} onChange={v => onU({ inward: v })} accent="#a78bfa" />
+    </div>
+    <div className="ec-row r2">
+      <Slider label="Arc Start" v={em.arc[0]} min={0} max={360} step={1} unit="ų" onChange={v => onU({ arc: [v, em.arc[1]] })} accent="#a78bfa" />
+      <Slider label="Arc End" v={em.arc[1]} min={0} max={360} step={1} unit="ų" onChange={v => onU({ arc: [em.arc[0], v] })} accent="#a78bfa" />
+    </div>
+  </div>
+);
+
+const CurveProps: React.FC<{ em: CurveEmitter; onU: (u: Partial<CurveEmitter>) => void }> = ({ em, onU }) => (
+  <div className="ec-type">
+    <div className="ec-row inline">
+      <span className="ec-label">Curve</span>
+      <Toggle options={[{ l: 'Quad', v: 'quadratic' }, { l: 'Cubic', v: 'cubic' }, { l: 'Cat', v: 'catmull' }]}
+        value={em.curveType} onChange={v => onU({ curveType: v })} accent="#ff6b6b" />
+      <span className="ec-info">{em.controlPoints.length} pts</span>
+    </div>
+    <div className="ec-row r3">
+      <Slider label="Samples" v={em.samples} min={4} max={256} step={1} onChange={v => onU({ samples: v })} accent="#ff6b6b" />
+      <Slider label="Anim" v={em.animationSpeed} min={0} max={5} step={0.05} onChange={v => onU({ animationSpeed: v })} accent="#ff6b6b" />
+    </div>
+  </div>
+);
+
+const TextProps: React.FC<{ em: TextEmitter; onU: (u: Partial<TextEmitter>) => void }> = ({ em, onU }) => (
+  <div className="ec-type">
+    <div className="ec-row inline">
+      <input className="ctrl-text" type="text" value={em.text} placeholder="Text..."
+        onChange={e => onU({ text: e.target.value })} />
+    </div>
+    <div className="ec-row r4">
+      <Slider label="Size" v={em.fontSize} min={12} max={256} step={1} onChange={v => onU({ fontSize: v })} accent="#fbbf24" />
+      <Slider label="Samples" v={em.samples} min={8} max={512} step={1} onChange={v => onU({ samples: v })} accent="#fbbf24" />
+      <Slider label="Weight" v={em.fontWeight} min={100} max={900} step={100} onChange={v => onU({ fontWeight: v })} accent="#fbbf24" />
+      <Slider label="Space" v={em.letterSpacing} min={-20} max={50} step={1} onChange={v => onU({ letterSpacing: v })} accent="#fbbf24" />
+    </div>
+    <div className="ec-row inline">
+      <Chip active={em.outline} onClick={() => onU({ outline: !em.outline })} accent="#fbbf24">Outline</Chip>
+    </div>
+  </div>
+);
+
+const SVGProps: React.FC<{ em: SVGEmitter; onU: (u: Partial<SVGEmitter>) => void }> = ({ em, onU }) => (
+  <div className="ec-type">
+    <div className="ec-row r3">
+      <Slider label="Samples" v={em.samples} min={8} max={512} step={1} onChange={v => onU({ samples: v })} accent="#f472b6" />
+      <Chip active={em.normalizeSize} onClick={() => onU({ normalizeSize: !em.normalizeSize })} accent="#f472b6">Normalize</Chip>
+      <span className="ec-info">{em.svgPath.length} chars</span>
+    </div>
+  </div>
+);
+
+const BrushProps: React.FC<{ em: BrushEmitter; onU: (u: Partial<BrushEmitter>) => void }> = ({ em, onU }) => (
+  <div className="ec-type">
+    <div className="ec-row r4">
+      <Slider label="Size" v={em.brushSize} min={0.001} max={0.2} step={0.001} onChange={v => onU({ brushSize: v })} accent="#34d399" />
+      <Slider label="Hard" v={em.brushHardness} min={0} max={1} step={0.01} onChange={v => onU({ brushHardness: v })} accent="#34d399" />
+      <Select value={em.playbackMode} options={[{ l: 'Once', v: 'once' }, { l: 'Loop', v: 'loop' }, { l: 'Ping', v: 'pingpong' }]} onChange={v => onU({ playbackMode: v as any })} />
+      <Slider label="Speed" v={em.playbackSpeed} min={0.1} max={5} step={0.1} onChange={v => onU({ playbackSpeed: v })} accent="#34d399" />
+    </div>
+    <div className="ec-row inline">
+      <span className="ec-info">{em.strokes.length} strokes</span>
+    </div>
+  </div>
+);
+
+// ============================================
+// Inline Emitter Type Bar - Always Visible
+// ============================================
+
+export const EmitterTypeBar: React.FC<{
+  onAdd: (cfg: Omit<Emitter, 'id'>) => void;
+}> = ({ onAdd }) => {
+  const [selectedType, setSelectedType] = useState<EmitterType | null>(null);
+  const presets = selectedType ? getPresetNames(selectedType) : [];
+
+  const types: { t: EmitterType; icon: string }[] = [
+    { t: 'point', icon: '?' }, { t: 'line', icon: '?' }, { t: 'circle', icon: '?' },
+    { t: 'curve', icon: '?' }, { t: 'text', icon: 'A' }, { t: 'svg', icon: '?' }, { t: 'brush', icon: '?' }
+  ];
+
+  const handleTypeClick = (type: EmitterType) => {
+    if (selectedType === type) {
+      // Double click same type = add default preset
+      const p = getPreset(type, getPresetNames(type)[0]);
+      if (p) onAdd(p);
+      setSelectedType(null);
+    } else {
+      setSelectedType(type);
+    }
+  };
+
+  const handlePresetClick = (name: string) => {
+    if (selectedType) {
+      const p = getPreset(selectedType, name);
+      if (p) onAdd(p);
+      setSelectedType(null);
+    }
+  };
+
+  return (
+    <div className="emitter-bar">
+      <div className="eb-label">ADD</div>
+      <div className="eb-types">
+        {types.map(t => (
+          <button key={t.t}
+            className={`eb-type ${selectedType === t.t ? 'active' : ''}`}
+            style={{ '--etc': emitterTypeColors[t.t]?.primary } as React.CSSProperties}
+            onClick={() => handleTypeClick(t.t)}
+            title={`Add ${t.t} emitter`}>
+            <span className="eb-icon">{t.icon}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Inline Presets - shows when type selected */}
+      <AnimatePresence>
+        {selectedType && presets.length > 0 && (
+          <motion.div className="eb-presets"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}>
+            {presets.map(name => (
+              <button key={name} className="eb-preset" onClick={() => handlePresetClick(name)}>
+                {name}
+              </button>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+

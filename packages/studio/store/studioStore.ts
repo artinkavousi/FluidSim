@@ -147,6 +147,8 @@ export interface StudioState {
   setMouseEnabled: (enabled: boolean) => void;
   mouseHoverMode: boolean;
   setMouseHoverMode: (enabled: boolean) => void;
+  mouseTool: 'fluid' | 'obstaclePaint' | 'obstacleErase' | 'fuelPaint' | 'heatPaint';
+  setMouseTool: (tool: 'fluid' | 'obstaclePaint' | 'obstacleErase' | 'fuelPaint' | 'heatPaint') => void;
   
   // Post-processing
   postConfig: RenderOutput2DConfig;
@@ -386,6 +388,8 @@ export const useStudioStore = create<StudioState>()(
     setMouseEnabled: (enabled) => set({ mouseEnabled: enabled }),
     mouseHoverMode: true, // Default to hover mode (no click needed)
     setMouseHoverMode: (enabled) => set({ mouseHoverMode: enabled }),
+    mouseTool: 'fluid',
+    setMouseTool: (tool) => set({ mouseTool: tool }),
     
     // ============================================
     // Post-processing
@@ -427,6 +431,7 @@ export const selectExport = (state: StudioState) => state.export;
 export const selectGizmosEnabled = (state: StudioState) => state.gizmosEnabled;
 export const selectMouseEnabled = (state: StudioState) => state.mouseEnabled;
 export const selectMouseHoverMode = (state: StudioState) => state.mouseHoverMode;
+export const selectMouseTool = (state: StudioState) => state.mouseTool;
 export const selectPostConfig = (state: StudioState) => state.postConfig;
 
 // History selectors

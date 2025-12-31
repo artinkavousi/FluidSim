@@ -15,5 +15,6 @@ export type {
   ExportSettings,
 } from './studioStore';
 export * from './studioStore';
+export * from './materialPresetStore';
 
 
